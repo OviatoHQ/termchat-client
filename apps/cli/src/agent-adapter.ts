@@ -24,7 +24,11 @@ export interface InstallResult {
   backupPath: string | null;
   launcherPath: string;
   statuslineInstalled: boolean;
-  /** Why the status line was not installed (existing one present, or unsupported). */
+  /** True when our status line was composed on top of a pre-existing one (presence
+   *  appended) rather than installed fresh. */
+  statuslineAppended: boolean;
+  /** Why the status line was not installed (e.g. the agent has no command-backed
+   *  status line to inject into). */
   statuslineSkippedReason: string | null;
   /** A one-time manual step the user must take to activate the install, if any
    *  (e.g. Codex requires `/hooks` to trust a newly-added hook). */

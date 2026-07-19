@@ -30,22 +30,25 @@ function clock(secs: number): string {
 }
 
 /**
- * Render the ambient (idle) status line in the "wire" style: `● termchat 37 · ⚡4` —
- * the dot is lime (presence signal), `termchat` + the online count sit in fg/muted,
- * and the `⚡`+experts count is amber (money surface). Deliberately minimal: no room
- * or unread info (docs handoff). Experts is shown only when non-zero.
+ * Render the ambient (idle) status line in the "wire" style: `▄▀ tc 12 online · ⚡4
+ * experts` — the ▄▀ mark is the two-tone brand, `tc` + the online count sit in
+ * muted/fg with a muted `online` label, and the `⚡`+experts count is amber (money
+ * surface) with a muted `experts` label. Deliberately minimal: no room or unread
+ * info (docs handoff). Experts is shown only when non-zero.
  */
 export function renderLine(counts: PresenceCounts, color: boolean = useColor()): string {
   const online = fmt(counts.online);
   const experts = counts.experts > 0 ? counts.experts : 0;
   if (!color) {
-    return experts > 0 ? `▄▀ termchat ${online} · ⚡${experts}` : `▄▀ termchat ${online}`;
+    return experts > 0 ? `▄▀ tc ${online} online · ⚡${experts} experts` : `▄▀ tc ${online} online`;
   }
   // The ▄▀ brand mark (lime ▄ + amber ▀) replaces the presence dot — same two-tone
   // as the TUI top bar and the web logo's two squares.
   const mark = `${LIME}▄${AMBER}▀${RESET}`;
-  const head = `${mark} ${MUTED}termchat${RESET} ${FG}${online}${RESET}`;
-  return experts > 0 ? `${head} ${MUTED}·${RESET} ${AMBER}⚡${experts}${RESET}` : head;
+  const head = `${mark} ${MUTED}tc${RESET} ${FG}${online}${RESET} ${MUTED}online${RESET}`;
+  return experts > 0
+    ? `${head} ${MUTED}·${RESET} ${AMBER}⚡${experts}${RESET} ${MUTED}experts${RESET}`
+    : head;
 }
 
 /** Live in-call state the seeker's TUI records so the daemon can render the meter.

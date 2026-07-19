@@ -38,6 +38,13 @@ export function statuslineScriptPath(): string {
   return join(termchatHome(), "statusline.sh");
 }
 
+/** Sidecar holding the agent's ORIGINAL `statusLine` object (verbatim) when termchat
+ *  wraps it to append presence. Read on re-install (so we never wrap our own wrapper)
+ *  and on uninstall (to restore exactly what was there before). */
+export function wrappedStatuslinePath(): string {
+  return join(termchatHome(), "wrapped-statusline.json");
+}
+
 export function credentialsPath(): string {
   return join(termchatHome(), "credentials.json");
 }

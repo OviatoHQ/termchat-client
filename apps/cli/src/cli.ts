@@ -71,7 +71,12 @@ async function main(): Promise<void> {
         console.log(`termchat wired into ${result.agent} (${result.settingsPath})`);
         console.log(`  launcher: ${result.launcherPath}`);
         if (result.backupPath) console.log(`  backup:   ${result.backupPath}`);
-        if (result.statuslineInstalled) console.log("  status line installed");
+        if (result.statuslineInstalled)
+          console.log(
+            result.statuslineAppended
+              ? "  status line: presence appended to your existing one"
+              : "  status line installed",
+          );
         if (result.statuslineSkippedReason)
           console.log(`  status line: ${result.statuslineSkippedReason}`);
         if (result.followUp) console.log(`  ⚠ ${result.followUp}`);

@@ -71,6 +71,7 @@ export const codexAdapter: AgentAdapter = {
       backupPath,
       launcherPath: launcher,
       statuslineInstalled: false,
+      statuslineAppended: false,
       statuslineSkippedReason: options.statusline
         ? "Codex has no command-backed status line — presence shows via desktop notification + the termchat TUI"
         : null,

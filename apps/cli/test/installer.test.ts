@@ -75,7 +75,7 @@ test("install wires the four Phase 0 hook events and writes a launcher", () => {
   expect(existsSync(result.launcherPath)).toBe(true);
 });
 
-test("install preserves a user's existing hooks, statusLine, and unrelated keys", () => {
+test("install preserves a user's existing hooks and unrelated keys", () => {
   seedSettings({
     hooks: {
       UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo mine" }] }],
@@ -93,8 +93,54 @@ test("install preserves a user's existing hooks, statusLine, and unrelated keys"
   expect(userPrompt.some((command) => command.includes("TERMCHAT_HOOK=1"))).toBe(true);
 
   expect(commandsFor(settings, "PreToolUse")).toEqual(["echo pre"]);
-  expect((settings.statusLine as { command?: string }).command).toBe("my-statusline");
   expect(settings.model).toBe("opus");
+});
+
+function readGeneratedStatusline(): string {
+  return readFileSync(join(process.env.TERMCHAT_HOME as string, "statusline.sh"), "utf8");
+}
+
+test("install --statusline appends to (wraps) an existing status line", () => {
+  seedSettings({ statusLine: { type: "command", command: "my-statusline" } });
+
+  const result = install({ statusline: true });
+  expect(result.statuslineInstalled).toBe(true);
+  expect(result.statuslineAppended).toBe(true);
+
+  // The setting now points at our wrapper…
+  const command = (readSettings().statusLine as { command?: string }).command ?? "";
+  expect(command).toContain("TERMCHAT_STATUSLINE=1");
+  expect(command).toContain("statusline.sh");
+
+  // …and the generated wrapper runs the original AND appends the presence line.
+  const script = readGeneratedStatusline();
+  expect(script).toContain("my-statusline");
+  expect(script).toContain("online.line");
+  // termchat's own contribution never touches the network.
+  for (const forbidden of ["curl", "wget", "/dev/tcp", "http://", "https://"]) {
+    expect(script.includes(forbidden)).toBe(false);
+  }
+});
+
+test("re-running install --statusline over an appended one does not double-wrap", () => {
+  seedSettings({ statusLine: { type: "command", command: "my-statusline" } });
+  install({ statusline: true });
+  install({ statusline: true });
+
+  const script = readGeneratedStatusline();
+  // The original appears exactly once (we wrap the sidecar original, not our wrapper).
+  expect(script.split("my-statusline").length - 1).toBe(1);
+  expect(script).not.toContain("TERMCHAT_STATUSLINE=1");
+});
+
+test("uninstall restores the wrapped original status line verbatim", () => {
+  seedSettings({ statusLine: { type: "command", command: "my-statusline", padding: 2 } });
+  install({ statusline: true });
+  uninstall();
+
+  const restored = readSettings().statusLine as { command?: string; padding?: number };
+  expect(restored.command).toBe("my-statusline");
+  expect(restored.padding).toBe(2);
 });
 
 test("re-running install is idempotent (no duplicate termchat entries)", () => {
@@ -109,12 +155,30 @@ test("re-running install is idempotent (no duplicate termchat entries)", () => {
   }
 });
 
-test("install --statusline sets our status line only when none exists", () => {
+test("install --statusline installs a fresh status line when none exists", () => {
   const result = install({ statusline: true });
   expect(result.statuslineInstalled).toBe(true);
+  expect(result.statuslineAppended).toBe(false);
   const command = (readSettings().statusLine as { command?: string }).command ?? "";
   expect(command).toContain("TERMCHAT_STATUSLINE=1");
   expect(command).toContain("statusline.sh");
+});
+
+test("the wrapper composes the prior line and presence on one line", async () => {
+  const home = process.env.TERMCHAT_HOME as string;
+  seedSettings({ statusLine: { type: "command", command: "printf 'PRIOR'" } });
+  install({ statusline: true });
+  writeFileSync(join(home, "online.line"), "▄▀ tc 12 online\n");
+
+  const script = join(home, "statusline.sh");
+  const proc = Bun.spawn(["bash", script], {
+    env: { ...process.env, TERMCHAT_HOME: home },
+    stdin: new Response("{}"),
+    stdout: "pipe",
+  });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  expect(out.trim()).toBe("PRIOR  ▄▀ tc 12 online");
 });
 
 test("install backs up an existing settings.json", () => {

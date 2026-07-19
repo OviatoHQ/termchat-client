@@ -12,15 +12,17 @@ import {
 } from "../src/line.ts";
 
 test("renderLine shows the wire idle line and hides zero experts", () => {
-  expect(renderLine({ online: 1284, waiting: 0, experts: 0 }, false)).toBe("▄▀ termchat 1,284");
+  expect(renderLine({ online: 1284, waiting: 0, experts: 0 }, false)).toBe("▄▀ tc 1,284 online");
 });
 
 test("renderLine appends ⚡ + the experts count when non-zero", () => {
-  expect(renderLine({ online: 37, waiting: 0, experts: 4 }, false)).toBe("▄▀ termchat 37 · ⚡4");
+  expect(renderLine({ online: 37, waiting: 0, experts: 4 }, false)).toBe(
+    "▄▀ tc 37 online · ⚡4 experts",
+  );
 });
 
 test("renderLine ignores waiting (the wire idle line carries no room/queue info)", () => {
-  expect(renderLine({ online: 5, waiting: 2, experts: 0 }, false)).toBe("▄▀ termchat 5");
+  expect(renderLine({ online: 5, waiting: 2, experts: 0 }, false)).toBe("▄▀ tc 5 online");
 });
 
 test("renderLine with color makes the ▄▀ mark lime+amber and the experts count amber", () => {
