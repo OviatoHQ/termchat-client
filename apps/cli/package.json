@@ -1,0 +1,30 @@
+{
+  "name": "@termchat/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The termchat Bun CLI: presence daemon, Claude Code hooks, and safe installer.",
+  "bin": {
+    "termchat": "./src/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "daemon": "bun src/cli.ts daemon",
+    "install:hooks": "bun src/cli.ts install --statusline"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.2.0",
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
+    "@termchat/protocol": "workspace:*",
+    "ink": "^5.0.1",
+    "react": "^18.3.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "@types/react": "^18.3.12",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^5.6.3"
+  }
+}
