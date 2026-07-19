@@ -16,21 +16,23 @@ import { billingLinkNotice, dashboardNotice } from "../billing.ts";
 import { type Command, parseCommand } from "../commands.ts";
 import { clearCredentials, writeCredentials } from "../config.ts";
 import { type DmController, type DmControllerState, createDmController } from "../dm-controller.ts";
+import { writeCallState } from "../line.ts";
 import type { ChatLine, LoungeClient, LoungeState } from "../lounge-client.ts";
 import { MarketplaceClient } from "../marketplace-client.ts";
 import { openUrl } from "../open-url.ts";
 import { PresenceNotifyClient } from "../presence-notify.ts";
 import { hitTest, regionsForView } from "./hit-test.ts";
 import type { MouseEvent } from "./mouse.ts";
-import { TABS, TAB_LABELS, type TabId, reduceKey } from "./nav.ts";
+import { type TabId, reduceKey, windowStripCells } from "./nav.ts";
+import { C, G, cellWidth, nickColor } from "./theme.ts";
 import { useMouse } from "./use-mouse.ts";
 
 const HELP_LINES = [
-  "lounge: /nick <name> · /join <room> · /rooms · /topic <tag> · /report <user> · /who",
-  "account: /login · /logout · /whoami · /dashboard · /card · /onboard",
-  "expert: /expert on <rate> [topics] · /expert off · /summon [@handle] <maxRate> <problem> · /accept · /decline · /end · /review <1-5> · /experts · /earnings · /dispute <id>",
-  "bounty: /bounty <price> <question> · /claim <id> · /answer <id> <text> (experts) · /accept <id> · /reject <id> (seeker)",
-  "/help · /quit · anything else is a chat message.",
+  "chat: /nick <name> · /join <room> · /rooms · /topic <tag> · /who · /dm <user> [msg] · /report <user>",
+  "you: /login · /logout · /whoami · /dashboard · /card · /quit",
+  "need help: /call [@handle] <maxRate> <problem> · /bounty <price> <question> · /experts · /approve <id> · /reject <id> · /review <1-5> · /dispute <id>",
+  "give help: /expert on <rate> [topics] · /expert off · /accept · /decline · /end · /claim <id> · /answer <id> <text> · /earnings · /onboard",
+  "/help · anything else is a chat message.",
 ];
 
 const MKT_LOG_MAX = 8;
@@ -76,6 +78,8 @@ export interface AppProps {
   dmController?: DmController;
   /** Test seam: render once and skip raw-mode input wiring. */
   staticInput?: boolean;
+  /** Initial status-line notice (e.g. a stale-session warning). Defaults to help. */
+  notice?: string;
 }
 
 function fmtMembers(members: RosterEntry[]): string[] {
@@ -116,10 +120,24 @@ function useBlink(active: boolean): boolean {
   return on;
 }
 
-/** Distinct color for the local user's own name (chat + roster); others stay cyan. */
-const SELF_COLOR = "magenta";
-
 const usd = (cents: number): string => `$${(cents / 100).toFixed(2)}`;
+
+/** `HH:MM` for a millisecond timestamp — irssi-style transcript timestamps. */
+function hhmm(ts: number): string {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** `MM:SS` for a live-meter elapsed-seconds count. */
+function clock(secs: number): string {
+  return `${String(Math.floor(secs / 60)).padStart(2, "0")}:${String(secs % 60).padStart(2, "0")}`;
+}
+
+/** The color for a chat/roster nick: self renders bright; others hash to a stable
+ *  color from the "wire" nick palette. */
+function nickProps(handle: string, isSelf: boolean): { color: string; bold?: boolean } {
+  return isSelf ? { color: C.fgBright, bold: true } : { color: nickColor(handle) };
+}
 
 /** Render a marketplace event as a single transcript-style line. */
 function fmtMarket(m: ServerMarketplaceMessage): string {
@@ -130,8 +148,8 @@ function fmtMarket(m: ServerMarketplaceMessage): string {
       return "no longer listed as an expert";
     case "summon_pending":
       return m.target
-        ? `summon sent to ${m.target} — waiting for them to accept…`
-        : `summon sent to ${m.candidates} expert(s) — waiting…`;
+        ? `call sent to ${m.target} — waiting for them to accept…`
+        : `call sent to ${m.candidates} expert(s) — waiting…`;
     case "no_experts":
       return `no experts available under $${m.maxRate}/min${m.topic ? ` for ${m.topic}` : ""}`;
     case "summon_request":
@@ -160,7 +178,7 @@ function fmtMarket(m: ServerMarketplaceMessage): string {
     case "bounty_claimed":
       return `claimed bounty #${m.bountyId} (${usd(m.priceCents)}) — answer with /answer ${m.bountyId} <text>`;
     case "bounty_answered":
-      return `📩 bounty #${m.bountyId} answered by ${m.from} (${usd(m.priceCents)}): "${m.answer}" — /accept ${m.bountyId} or /reject ${m.bountyId}`;
+      return `📩 bounty #${m.bountyId} answered by ${m.from} (${usd(m.priceCents)}): "${m.answer}" — /approve ${m.bountyId} or /reject ${m.bountyId}`;
     case "bounty_expired":
       return `bounty #${m.bountyId} expired — your ${usd(m.priceCents)} hold was released, no charge`;
     case "system":
@@ -178,6 +196,7 @@ export function App({
   onCall,
   dmController: initialDmController,
   staticInput,
+  notice: initialNotice,
 }: AppProps): React.ReactElement {
   const { exit } = useApp();
   const [state, setState] = useState<LoungeState>(client.getState());
@@ -186,7 +205,7 @@ export function App({
     initialDmController?.getState() ?? null,
   );
   const [draft, setDraft] = useState("");
-  const [notice, setNotice] = useState<string>(HELP_LINES[0] ?? "");
+  const [notice, setNotice] = useState<string>(initialNotice ?? HELP_LINES[0] ?? "");
   const [mktLog, setMktLog] = useState<string[]>([]);
   // Identity/session state is mutable so /login and /logout work in place.
   const [user, setUser] = useState<string | null>(initialUser);
@@ -206,6 +225,19 @@ export function App({
   const [reviewTarget, setReviewTarget] = useState<{ sessionId: number; peer: string } | null>(
     null,
   );
+  // The summon-confirm view (design 2a): rendered in place of the Experts body when an
+  // expert's [summon] is activated. Not a tab — a body-state gated on the Experts tab.
+  const [summonExpert, setSummonExpert] = useState<ExpertCard | null>(null);
+  // Live in-call meter (design 2a bars + status line). Captured on `session_start`,
+  // cleared on `session_end`; the estimate rides connected minutes only. The edge stays
+  // the billing authority — this is the local at-a-glance readout.
+  const [call, setCall] = useState<{ sessionId: number; peer: string; rate: number } | null>(null);
+  const [callSecs, setCallSecs] = useState(0);
+  useEffect(() => {
+    if (!call || staticInput) return;
+    const id = setInterval(() => setCallSecs((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [call, staticInput]);
 
   useEffect(() => {
     setState(client.getState());
@@ -259,13 +291,23 @@ export function App({
         return;
       }
       setMktLog((log) => [...log, fmtMarket(m)].slice(-MKT_LOG_MAX));
-      // Opening a session pops the relay-only audio call page in the browser.
+      // Opening a session pops the relay-only audio call page in the browser + starts
+      // the local in-call meter shown in both status bars, and records call.json so the
+      // presence daemon can render the same meter in the Claude Code status line.
       if (m.type === "session_start") {
+        setCall({ sessionId: m.sessionId, peer: m.peer, rate: m.rate });
+        setCallSecs(0);
+        writeCallState({ peer: m.peer, rate: m.rate, startedAt: Date.now() });
         if (session && token) {
           openUrl(`${session.httpBase}/call#session=${m.sessionId}&token=${token}&rate=${m.rate}`);
         } else {
           onCall?.(m.sessionId, m.rate);
         }
+      }
+      // Ending it stops the meter (the ended session lands in the Calls tab to rate).
+      if (m.type === "session_end") {
+        setCall(null);
+        writeCallState(null);
       }
     });
   }, [marketplace, session, token, onCall]);
@@ -570,6 +612,7 @@ export function App({
         setNotice(HELP_LINES.join("  "));
         break;
       case "quit":
+        writeCallState(null); // don't leave a stale meter in the status line
         marketplace?.close();
         client.close();
         exit();
@@ -651,6 +694,7 @@ export function App({
   const switchTab = (tab: TabId): void => {
     setActiveTab(tab);
     setSelection(0);
+    setSummonExpert(null); // leaving Experts abandons an open summon-confirm
     if (tab === "experts") marketplace?.experts(); // refresh the directory on entry
     if (tab === "bounties") marketplace?.bounties(); // refresh the board on entry
     if (tab === "calls") marketplace?.mySessions(); // refresh your sessions on entry
@@ -665,20 +709,18 @@ export function App({
       const e = experts[index];
       if (!e) return;
       if (!marketplace || !user) {
-        setNotice("Sign in with /login to summon an expert.");
+        setNotice("Sign in with /login to call an expert.");
         return;
       }
       if (!e.online) {
         setNotice(`${e.user} is offline — post an async bounty: /bounty <price> <question>.`);
         return;
       }
-      // There's no targeted-summon primitive yet (summon is a topic/rate auction),
-      // so prefill a summon at this expert's rate and hand off to the Lounge input
-      // for the seeker to type the problem. See docs/UI-EXPLORATION.md.
-      setDraft(`/summon ${e.rate} `);
-      setActiveTab("lounge");
-      setSelection(0);
-      setNotice(`Type your problem, then Enter to summon an expert @ ≤ $${e.rate}/min.`);
+      // Open the summon-confirm view (design 2a): the seeker reviews the hold, types the
+      // problem into the input line, and authorizes. Confirm dispatches a targeted summon.
+      setSummonExpert(e);
+      setDraft("");
+      setNotice(`Describe your problem, then Enter to authorize the hold for ${e.user}.`);
       return;
     }
     if (tab === "bounties") {
@@ -726,6 +768,28 @@ export function App({
     }
   };
 
+  // Authorize the hold from the summon-confirm view: a TARGETED summon at the expert's
+  // rate with the typed problem. Returns to the Lounge so the pending/accept lines show.
+  const confirmSummon = (): void => {
+    const e = summonExpert;
+    if (!e) return;
+    if (!marketplace || !user) {
+      setNotice("Sign in with /login to summon an expert.");
+      return;
+    }
+    const problem = draft.trim();
+    if (!problem) {
+      setNotice("Describe your problem first, then Enter to authorize the hold.");
+      return;
+    }
+    marketplace.summon({ problem, maxRate: e.rate, target: e.user });
+    setSummonExpert(null);
+    setDraft("");
+    setActiveTab("lounge");
+    setSelection(0);
+    setNotice(`Summoning ${e.user} @ ≤ $${e.rate}/min…`);
+  };
+
   // Mouse (step 3): route a left-click through the same region map the layout draws,
   // to the same `switchTab`/`activate` handlers the keyboard uses. Clicks only for
   // now — wheel scroll pairs with the deferred Lounge scrollback. This is redefined
@@ -736,6 +800,7 @@ export function App({
     const regions = regionsForView({
       activeTab,
       cols,
+      dmUnread,
       expertsCount: experts.length,
       meCount: meActions.length,
       bountiesCount: bounties.length,
@@ -773,6 +838,25 @@ export function App({
       // keypress whose `input` begins "[<". Swallow it here — `useMouse` handles the
       // real event — so it never lands in the chat draft.
       if (input.startsWith("[<") || input.startsWith("\x1b[<")) return;
+      // The summon-confirm view (design 2a) captures the input line as the `problem`
+      // field: type to edit, Enter authorizes the hold, Esc cancels back to Experts.
+      if (summonExpert) {
+        if (key.escape) {
+          setSummonExpert(null);
+          setNotice("Summon cancelled.");
+          return;
+        }
+        if (key.return) {
+          confirmSummon();
+          return;
+        }
+        if (key.backspace || key.delete) {
+          setDraft((d) => d.slice(0, -1));
+          return;
+        }
+        if (input && !key.ctrl && !key.meta) setDraft((d) => d + input);
+        return;
+      }
       const action = reduceKey(
         { activeTab, selection: sel, itemCount, draft, locked: pendingLogin !== null },
         input,
@@ -802,21 +886,52 @@ export function App({
     { isActive: staticInput !== true },
   );
 
-  // Blink the input cursor only when the Lounge input is actually focused.
+  // Blink the input cursor only when a text input is actually focused (Lounge, an open
+  // DM thread, or the summon-confirm `[problem]` field).
   const cursorOn = useBlink(
-    staticInput !== true && (activeTab === "lounge" || activeTab === "dms"),
+    staticInput !== true && (activeTab === "lounge" || activeTab === "dms" || summonExpert != null),
   );
 
-  const status = useMemo(() => {
-    const conn = state.connected ? "●" : "○";
-    // Verified: show the effective (display) name — matches the roster after `/nick`.
-    const label = user
-      ? `${state.self ?? user} ✓`
-      : state.self
-        ? `${state.self} (guest · /login to claim)`
-        : "connecting…";
-    return `${conn} ${state.guests} guest(s) · ${state.members.length} here · ${label}`;
-  }, [state.connected, state.guests, state.members.length, state.self, user]);
+  // Presence + meter readouts for the two olive status bars (design 2a).
+  const onlineCount = state.members.length + state.guests;
+  const onlineExperts = useMemo(() => experts.filter((e) => e.online), [experts]);
+  const minExpertRate = onlineExperts.length ? Math.min(...onlineExperts.map((e) => e.rate)) : null;
+  // In-call meter shows peer + elapsed time only — no running dollar. This surface
+  // can't see pause/connect, so a cost would overstate the bill during a pause; the
+  // browser call page + Session DO stay the money authorities.
+  const meterClock = clock(callSecs);
+  // `[nick(✓)]` shown on the notice row — the effective (display) name after /nick.
+  const selfTag = user
+    ? `${state.self ?? user}(✓)`
+    : (state.self ?? (state.connected ? "guest" : "connecting…"));
+
+  // The input line context (design 2a): lime `[#general]` in the lounge, `[mira]` in a
+  // DM query, `[problem]` while confirming a summon, `code` while pasting a login code.
+  // The summon-confirm view owns its own `[problem]` input (in the body), so it's
+  // excluded here — the bottom input line serves the Lounge and open DM threads.
+  const showInput =
+    !summonExpert &&
+    (activeTab === "lounge" || (activeTab === "dms" && Boolean(dmState?.activePeer)));
+  const inputContext = pendingLogin
+    ? "code"
+    : activeTab === "dms"
+      ? (dmState?.activeLabel ?? dmState?.activePeer ?? "dm")
+      : `#${state.room}`;
+  const loungeConnecting = activeTab === "lounge" && !who && !pendingLogin;
+
+  // Olive status bars: Ink 5 has no Box background, so each bar is padded Text filling
+  // the full row. Pad = cols − left − right, over-estimating the (emoji-bearing) right
+  // width so the bar never overflows and wraps (`cellWidth`).
+  const topRight = call
+    ? `${G.summon} ${call.peer} ${meterClock} [end] `
+    : `${G.online} ${onlineCount} online${minExpertRate != null ? `  ${G.summon} ${onlineExperts.length} experts from $${minExpertRate}/min` : ""} `;
+  const topPad = " ".repeat(
+    Math.max(1, cols - 16 /* " ▄▀ termchat " + "0.5" */ - cellWidth(topRight)),
+  );
+  const winCells = windowStripCells(activeTab, dmUnread);
+  const winLeftW = winCells.reduce((n, c) => n + c.text.length, 0);
+  const winRight = call ? `${G.summon} ${meterClock} ` : "call: ~45s to a human ";
+  const winPad = " ".repeat(Math.max(1, cols - winLeftW - cellWidth(winRight)));
 
   // Sidebar ~22% of width (clamped); chat gets the rest.
   const sidebarWidth = Math.min(26, Math.max(14, Math.floor(cols * 0.22)));
@@ -828,29 +943,63 @@ export function App({
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>
-      {/* title bar */}
+      {/* ── top olive bar: ▄▀ brand mark + presence, or the in-call meter + [end] ── */}
       <Box>
-        <Text bold color="green">
+        <Text backgroundColor={C.barBg}> </Text>
+        <Text backgroundColor={C.barBg} color={C.accent} bold>
+          ▄
+        </Text>
+        <Text backgroundColor={C.barBg} color={C.amber} bold>
+          ▀
+        </Text>
+        <Text backgroundColor={C.barBg} color={C.barFg} bold>
           {" termchat "}
         </Text>
-        <Text color="cyan">{`#${state.room}`}</Text>
-        <Text dimColor>{`   ${LOUNGE_ROOMS.length - 1} other rooms`}</Text>
+        <Text backgroundColor={C.barBg} color={C.barFg} dimColor>
+          0.5
+        </Text>
+        <Text backgroundColor={C.barBg}>{topPad}</Text>
+        {call ? (
+          <>
+            <Text backgroundColor={C.barBg} color={C.amber} bold>
+              {`${G.summon} ${call.peer} ${meterClock} `}
+            </Text>
+            <Text backgroundColor={C.endInverseBg} color={C.barFg} bold>
+              [end]
+            </Text>
+            <Text backgroundColor={C.barBg}> </Text>
+          </>
+        ) : (
+          <>
+            <Text backgroundColor={C.barBg} color={C.accent}>
+              {`${G.online} ${onlineCount} online`}
+            </Text>
+            {minExpertRate != null && (
+              <Text backgroundColor={C.barBg} color={C.amber}>
+                {`  ${G.summon} ${onlineExperts.length} experts from $${minExpertRate}/min`}
+              </Text>
+            )}
+            <Text backgroundColor={C.barBg}> </Text>
+          </>
+        )}
       </Box>
 
-      {/* tab strip — Tab / Shift+Tab switch; the active tab is bracketed */}
+      {/* ── olive window bar: numbered irssi windows (click / Tab) + summon hint ── */}
       <Box>
-        {TABS.map((t) => {
-          const isActive = t === activeTab;
-          // Highlight the DMs tab (colour only — width-neutral so mouse hit-testing
-          // stays aligned) when there are unread DMs and it's not the current tab.
-          const color = isActive ? "green" : t === "dms" && dmUnread > 0 ? "yellow" : "gray";
-          return (
-            <Text key={t} color={color} bold={isActive || (t === "dms" && dmUnread > 0)}>
-              {isActive ? `[${TAB_LABELS[t]}] ` : ` ${TAB_LABELS[t]}  `}
-            </Text>
-          );
-        })}
-        <Text dimColor>Tab ⇄ / click</Text>
+        {winCells.map((cell) => (
+          <Text
+            key={cell.tab}
+            backgroundColor={C.barBg}
+            color={cell.active ? C.barFg : cell.unread ? C.accent : "#b9b58c"}
+            bold={cell.active || cell.unread}
+          >
+            {cell.text}
+          </Text>
+        ))}
+        <Text backgroundColor={C.barBg}>{winPad}</Text>
+        <Text backgroundColor={C.barBg} color={call ? C.amber : C.fgBright}>
+          {winRight}
+        </Text>
       </Box>
 
       {/* body: the active tab */}
@@ -858,7 +1007,7 @@ export function App({
         <Box flexGrow={1}>
           <Box flexDirection="column" flexGrow={1} marginRight={1}>
             {shown.length === 0 ? (
-              <Text dimColor>No messages yet. Say hi!</Text>
+              <Text color={C.muted2}>No messages yet. Say hi!</Text>
             ) : (
               shown.map((line) => <ChatRow key={line.id} line={line} self={who} />)
             )}
@@ -867,33 +1016,42 @@ export function App({
             flexDirection="column"
             width={sidebarWidth}
             borderStyle="single"
-            borderColor="gray"
+            borderColor={C.line}
             borderTop={false}
             borderRight={false}
             borderBottom={false}
           >
-            <Text bold>{` in #${state.room}`}</Text>
+            <Text color={C.muted}>{` #${state.room.toUpperCase()} · ${state.members.length}`}</Text>
             {state.members.length === 0 ? (
-              <Text dimColor> — quiet —</Text>
+              <Text color={C.muted2}> — quiet —</Text>
             ) : (
               state.members.map((m) => {
                 const isSelf = m.user === who;
-                const name = m.verified ? `${m.user} ✓` : m.user;
-                const label = m.topic ? `${name} · ${m.topic}` : name;
                 return (
-                  <Text
-                    key={m.user}
-                    {...(isSelf ? { color: SELF_COLOR, bold: true } : {})}
-                  >{` ${label}`}</Text>
+                  <Text key={m.user}>
+                    <Text color={m.verified ? C.accent : C.muted}>
+                      {m.verified ? ` ${G.online}` : ` ${G.offline}`}
+                    </Text>
+                    <Text {...nickProps(m.user, isSelf)}>{` ${m.user}`}</Text>
+                    <Text
+                      color={C.muted2}
+                    >{`${m.verified ? " ✓" : ""}${m.topic ? ` ${m.topic}` : ""}`}</Text>
+                  </Text>
                 );
               })
             )}
+            <Box flexGrow={1} />
+            <Text color={C.muted2}> {G.online} verified</Text>
+            <Text color={C.muted2}> {G.offline} guest</Text>
           </Box>
         </Box>
       )}
-      {activeTab === "experts" && (
-        <ExpertsBody experts={experts} sel={sel} signedIn={Boolean(marketplace && user)} />
-      )}
+      {activeTab === "experts" &&
+        (summonExpert ? (
+          <SummonConfirmBody expert={summonExpert} problem={draft} cursorOn={cursorOn} />
+        ) : (
+          <ExpertsBody experts={experts} sel={sel} signedIn={Boolean(marketplace && user)} />
+        ))}
       {activeTab === "bounties" && (
         <BountiesBody bounties={bounties} sel={sel} signedIn={Boolean(marketplace && user)} />
       )}
@@ -915,46 +1073,41 @@ export function App({
         />
       )}
 
-      {/* marketplace event log (only when active) */}
+      {/* marketplace event log (only when active) — `-⚡-` money events in amber */}
       {mktLog.length > 0 && (
         <Box flexDirection="column">
-          <Text bold color="yellow">
-            marketplace
-          </Text>
           {mktLog.map((line, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: append-only capped log
-            <Text key={i} color="yellow">
-              · {line}
+            <Text key={i} color={C.amber}>
+              {` -${G.summon}- ${line}`}
             </Text>
           ))}
         </Box>
       )}
 
-      {/* footer: status · notice · input (Lounge, or an open DM thread) or nav hint */}
-      <Text dimColor>
-        {status}
-        {dmUnread > 0 ? ` · ✉ ${dmUnread} unread DM${dmUnread === 1 ? "" : "s"}` : ""}
+      {/* notice row: `[nick(✓)]` + the transient status/help message */}
+      <Text>
+        <Text color={C.muted2}>{`[${selfTag}] `}</Text>
+        <Text color={C.muted}>
+          {notice}
+          {dmUnread > 0 ? ` · ✉ ${dmUnread} unread DM${dmUnread === 1 ? "" : "s"}` : ""}
+        </Text>
       </Text>
-      <Text dimColor>{notice}</Text>
-      {activeTab === "lounge" || (activeTab === "dms" && dmState?.activePeer) ? (
+
+      {/* input line: lime context prompt + draft + blinking block cursor, or nav hint */}
+      {summonExpert ? (
+        <Text color={C.muted2}> Enter authorize the hold · Esc cancel</Text>
+      ) : showInput ? (
         <Box>
-          <Text {...(pendingLogin ? { color: "yellow" } : {})}>
-            {pendingLogin
-              ? "code> "
-              : activeTab === "dms"
-                ? `@${dmState?.activeLabel ?? dmState?.activePeer} > `
-                : who
-                  ? "> "
-                  : "connecting… "}
-          </Text>
-          <Text>{draft}</Text>
-          <Text>{cursorOn ? "█" : " "}</Text>
+          <Text color={C.accent}>{loungeConnecting ? "connecting… " : `[${inputContext}] `}</Text>
+          <Text color={C.fg}>{draft}</Text>
+          <Text color={C.fg}>{cursorOn ? "█" : " "}</Text>
         </Box>
       ) : (
-        <Text dimColor>
+        <Text color={C.muted2}>
           {activeTab === "dms"
-            ? "↑↓ pick a thread · Enter open · type to reply · Tab switch tab"
-            : "↑↓ move · Enter/click select · Tab switch tab"}
+            ? "↑↓ pick a thread · Enter open · type to reply · Tab switch window"
+            : "↑↓ move · Enter/click select · Tab switch window"}
         </Text>
       )}
     </Box>
@@ -973,25 +1126,103 @@ export function ExpertsBody({
 }): React.ReactElement {
   return (
     <Box flexDirection="column" flexGrow={1}>
-      <Text bold> Experts</Text>
+      <Text color={C.muted}> EXPERTS — LIVE NOW · SORTED BY RATING</Text>
       {!signedIn ? (
-        <Text dimColor> Sign in (Me tab · /login) to browse and summon experts.</Text>
+        <Text color={C.muted2}> Sign in (Me tab · /login) to browse and call experts.</Text>
       ) : experts.length === 0 ? (
-        <Text dimColor> No experts listed right now.</Text>
+        <Text color={C.muted2}> No experts listed right now.</Text>
       ) : (
         experts.map((e, i) => {
           const active = i === sel;
           const stars = e.rating != null ? `★${e.rating.toFixed(1)} (${e.ratingCount})` : "★ new";
-          const topics = e.topics.join(", ") || "any topic";
-          const cta = e.online ? "Summon" : "Bounty";
-          const label = `${active ? "›" : " "} ${e.online ? "●" : "○"} ${e.user}${e.topExpert ? " ⭐" : ""}  ${topics}  $${e.rate}/min  ${stars}  [ ${cta} ]`;
+          const topics = e.topics.join(" ") || "any";
           return (
-            <Text key={e.user} {...(active ? { color: "green", bold: true } : {})}>
-              {label}
+            <Text key={e.user} {...(active ? { backgroundColor: C.rowHighlight } : {})}>
+              <Text color={C.accent}>{active ? "›" : " "}</Text>
+              <Text color={e.online ? C.accent : C.muted}>
+                {e.online ? ` ${G.online}` : ` ${G.offline}`}
+              </Text>
+              <Text color={nickColor(e.user)} bold>{` ${e.user}`}</Text>
+              <Text color={C.accent}>
+                {e.topExpert ? ` ${G.verified}${G.topExpert}` : ` ${G.verified}`}
+              </Text>
+              <Text color={C.muted}>{`  ${topics}`}</Text>
+              <Text color={C.amber}>{`  $${e.rate}/min`}</Text>
+              <Text color={C.muted2}>{`  ${G.rating}${stars.replace("★", "")}`}</Text>
+              {e.online ? (
+                <Text backgroundColor={C.accent} color={C.bg} bold>
+                  {" call "}
+                </Text>
+              ) : (
+                <Text color={C.muted}>{" [bounty]"}</Text>
+              )}
             </Text>
           );
         })
       )}
+    </Box>
+  );
+}
+
+/** The summon-confirm view (design 2a): shown in place of the Experts body once an
+ *  expert's [summon] is activated. Label/value rows spell out the hold before the
+ *  seeker authorizes; the `problem` row is the live input line (Enter authorizes,
+ *  Esc cancels — handled in App). Amber marks every money value; lime the action. */
+export function SummonConfirmBody({
+  expert,
+  problem,
+  cursorOn,
+}: {
+  expert: ExpertCard;
+  problem: string;
+  cursorOn: boolean;
+}): React.ReactElement {
+  const holdMax = `$${(expert.rate * 30).toFixed(2)} max`;
+  const stars = expert.rating != null ? `★${expert.rating.toFixed(1)}` : "★ new";
+  const topics = expert.topics.join(" ") || "any";
+  return (
+    <Box flexDirection="column" flexGrow={1}>
+      <Text color={C.amber}>{` SUMMON ${expert.user.toUpperCase()} — CONFIRM THE HOLD`}</Text>
+      <Text> </Text>
+      <Text>
+        <Text color={C.muted2}>{" expert     "}</Text>
+        <Text color={nickColor(expert.user)} bold>
+          {expert.user}
+        </Text>
+        <Text color={C.accent}>
+          {expert.topExpert ? ` ${G.verified}${G.topExpert}` : ` ${G.verified}`}
+        </Text>
+        <Text color={C.muted2}>{`  ${topics} · ${stars} · answers in ~45s avg`}</Text>
+      </Text>
+      <Text>
+        <Text color={C.muted2}>{" rate       "}</Text>
+        <Text color={C.amber}>{`$${expert.rate}/min`}</Text>
+        <Text color={C.muted2}>{"  · billed on connected minutes only · pause anytime"}</Text>
+      </Text>
+      <Text>
+        <Text color={C.muted2}>{" cap        "}</Text>
+        <Text color={C.fg}>30 min</Text>
+      </Text>
+      <Text>
+        <Text color={C.muted2}>{" hold now   "}</Text>
+        <Text color={C.amber}>{holdMax}</Text>
+        <Text color={C.muted2}>{"  · typical call 6–12 min · refund-friendly disputes"}</Text>
+      </Text>
+      <Text> </Text>
+      <Text>
+        <Text color={C.muted2}>{" problem    "}</Text>
+        <Text color={C.fgBright}>{problem}</Text>
+        <Text color={C.fg}>{cursorOn ? "█" : " "}</Text>
+      </Text>
+      <Text> </Text>
+      <Text>
+        <Text
+          backgroundColor={C.accent}
+          color={C.bg}
+          bold
+        >{` ${G.summon} call — authorize ${holdMax.replace(" max", "")} hold `}</Text>
+        <Text color={C.muted}>{"   [cancel]"}</Text>
+      </Text>
     </Box>
   );
 }
@@ -1012,30 +1243,40 @@ export function BountiesBody({
   if (!signedIn) {
     return (
       <Box flexDirection="column" flexGrow={1}>
-        <Text bold> Bounties</Text>
-        <Text dimColor> Sign in (Me tab · /login) to browse and post bounties.</Text>
+        <Text color={C.muted}> BOUNTIES — ASYNC QUESTIONS, FIXED PRICE</Text>
+        <Text color={C.muted2}> Sign in (Me tab · /login) to browse and post bounties.</Text>
       </Box>
     );
   }
   const postActive = sel === bounties.length;
   return (
     <Box flexDirection="column" flexGrow={1}>
-      <Text bold> Bounties</Text>
+      <Text color={C.muted}> BOUNTIES — ASYNC QUESTIONS, FIXED PRICE</Text>
       {bounties.map((b, i) => {
         const active = i === sel;
         const topic = b.topic ?? "any";
         const q = b.question.length > 48 ? `${b.question.slice(0, 47)}…` : b.question;
-        const label = `${active ? "›" : " "} #${b.bountyId} ${usd(b.priceCents)}  ${topic}  "${q}"  [ Claim ]`;
         return (
-          <Text key={b.bountyId} {...(active ? { color: "green", bold: true } : {})}>
-            {label}
+          <Text key={b.bountyId} {...(active ? { backgroundColor: C.rowHighlight } : {})}>
+            <Text color={C.accent}>{active ? "›" : " "}</Text>
+            <Text color={C.fg}>{` #${b.bountyId}`}</Text>
+            <Text color={C.amber}>{`  ${usd(b.priceCents)}`}</Text>
+            <Text color={C.muted}>{`  ${topic}`}</Text>
+            <Text color={C.fg2}>{`  "${q}"`}</Text>
+            <Text color={C.accent}>{"  [claim]"}</Text>
           </Text>
         );
       })}
-      <Text {...(postActive ? { color: "green", bold: true } : {})}>
-        {`${postActive ? "›" : " "} [ Post a bounty ]`}
+      <Text {...(postActive ? { backgroundColor: C.rowHighlight } : {})}>
+        <Text color={C.accent}>{postActive ? "›" : " "}</Text>
+        <Text color={C.accent}>{" [post a bounty]"}</Text>
+        <Text color={C.muted2}>
+          {"  money is held, not charged — you pay only when you accept"}
+        </Text>
       </Text>
-      {bounties.length === 0 && <Text dimColor> No open bounties yet — post one above.</Text>}
+      {bounties.length === 0 && (
+        <Text color={C.muted2}> No open bounties yet — post one above.</Text>
+      )}
     </Box>
   );
 }
@@ -1058,33 +1299,44 @@ export function CallsBody({
   if (!signedIn) {
     return (
       <Box flexDirection="column" flexGrow={1}>
-        <Text bold> Calls</Text>
-        <Text dimColor> Sign in (Me tab · /login) to see your calls.</Text>
+        <Text color={C.muted}> CALLS</Text>
+        <Text color={C.muted2}> Sign in (Me tab · /login) to see your calls.</Text>
       </Box>
     );
   }
   return (
     <Box flexDirection="column" flexGrow={1}>
-      <Text bold> Calls</Text>
-      <Text {...(active == null ? { dimColor: true } : {})}>
-        {active == null ? " No active call." : ` Active: session #${active} — /end to finish.`}
-      </Text>
-      <Text dimColor>
-        {sessions.length === 0 ? " No past calls yet." : " Past calls — select one to review:"}
+      <Text color={C.muted}> CALLS</Text>
+      {active == null ? (
+        <Text color={C.muted2}> no active call</Text>
+      ) : (
+        <Text>
+          <Text color={C.accent}>{` ${G.livePlay} `}</Text>
+          <Text color={C.fg}>{`session #${active} live`}</Text>
+          <Text color={C.muted2}>{" — /end to finish"}</Text>
+        </Text>
+      )}
+      <Text color={C.muted2}>
+        {sessions.length === 0 ? " no past calls yet" : " past calls — select one to review:"}
       </Text>
       {sessions.map((s, i) => {
         const active_ = i === sel;
+        const isExpert = s.role === "expert";
         const tag = s.reviewed
-          ? "✓ reviewed"
+          ? `${G.verified} reviewed`
           : s.reviewable
-            ? "★ rate"
-            : s.role === "expert"
-              ? "(you were the expert)"
+            ? `[${G.rating} rate]`
+            : isExpert
+              ? `you were the expert · earned ${usd(s.amountCents)}`
               : s.status;
-        const label = `${active_ ? "›" : " "} #${s.sessionId} ${s.peer}  ${s.minutes}min  ${usd(s.amountCents)}  ${tag}`;
         return (
-          <Text key={s.sessionId} {...(active_ ? { color: "green", bold: true } : {})}>
-            {label}
+          <Text key={s.sessionId} {...(active_ ? { backgroundColor: C.rowHighlight } : {})}>
+            <Text color={C.accent}>{active_ ? "›" : " "}</Text>
+            <Text color={C.fg}>{` #${s.sessionId}`}</Text>
+            <Text color={nickColor(s.peer)}>{` ${s.peer}`}</Text>
+            <Text color={C.muted}>{`  ${s.minutes}min`}</Text>
+            <Text color={C.amber}>{`  ${usd(s.amountCents)}`}</Text>
+            <Text color={s.reviewable ? C.accent : C.muted2}>{`  ${tag}`}</Text>
           </Text>
         );
       })}
@@ -1106,18 +1358,30 @@ export function MeBody({
 }): React.ReactElement {
   return (
     <Box flexDirection="column" flexGrow={1}>
-      <Text bold> Me</Text>
-      <Text dimColor>
-        {user
-          ? ` Signed in as ${self ?? user}${self && self !== user ? ` (${user})` : ""} ✓`
-          : ` Guest: ${self ?? "connecting…"}`}
+      <Text color={C.muted}> ME</Text>
+      <Text>
+        {user ? (
+          <>
+            <Text color={C.fgBright} bold>{` ${self ?? user}`}</Text>
+            <Text color={C.accent}>{` ${G.verified}`}</Text>
+            <Text color={C.muted2}>
+              {`${self && self !== user ? ` (${user})` : ""} verified via github`}
+            </Text>
+          </>
+        ) : (
+          <Text color={C.muted2}>{` guest: ${self ?? "connecting…"}`}</Text>
+        )}
       </Text>
-      <Text> </Text>
+      <Text color={C.muted2}>
+        {" "}
+        card entry and payouts always open in the browser — never the terminal
+      </Text>
       {actions.map((a, i) => {
         const active = i === sel;
         return (
-          <Text key={a.label} {...(active ? { color: "green", bold: true } : {})}>
-            {`${active ? "›" : " "} ${a.label}`}
+          <Text key={a.label} {...(active ? { backgroundColor: C.rowHighlight } : {})}>
+            <Text color={C.accent}>{active ? "›" : " "}</Text>
+            <Text color={active ? C.fgBright : C.fg} bold={active}>{` ${a.label}`}</Text>
           </Text>
         );
       })}
@@ -1141,7 +1405,7 @@ export function DmsBody({
   if (!signedIn) {
     return (
       <Box flexGrow={1}>
-        <Text dimColor> Sign in with /login to send direct messages.</Text>
+        <Text color={C.muted2}> Sign in with /login to send direct messages.</Text>
       </Box>
     );
   }
@@ -1154,6 +1418,7 @@ export function DmsBody({
     if (from === dm?.activePeer) return dm?.activeLabel ?? from;
     return from;
   };
+  const isMine = (from: string): boolean => Boolean(active?.self && from === active.self);
 
   return (
     <Box flexGrow={1}>
@@ -1161,24 +1426,35 @@ export function DmsBody({
       <Box flexDirection="column" flexGrow={1} marginRight={1}>
         {dm?.activePeer ? (
           <>
-            <Text bold color="cyan">{`── @${dm.activeLabel ?? dm.activePeer} ──`}</Text>
+            <Text>
+              <Text color={C.muted2}>{" -!- query with "}</Text>
+              <Text {...nickProps(dm.activeLabel ?? dm.activePeer, false)}>
+                {dm.activeLabel ?? dm.activePeer}
+              </Text>
+              <Text color={C.accent}>{` ${G.verified}`}</Text>
+            </Text>
             <DmHeader keyStatus={dm.keyStatus} safetyWords={dm.safetyWords} />
             {dm.error ? (
-              <Text color="yellow">{` ${dm.error}`}</Text>
+              <Text color={C.danger}>{` ${dm.error}`}</Text>
             ) : (active?.lines.length ?? 0) === 0 ? (
-              <Text dimColor> No messages yet. Type below to say hi.</Text>
+              <Text color={C.muted2}> No messages yet. Type below to say hi.</Text>
             ) : (
               active?.lines.map((l) => (
                 <Text key={l.id} {...(l.pending ? { dimColor: true } : {})}>
-                  {l.undecryptable
-                    ? ` ${senderLabel(l.from)}: [can't decrypt]`
-                    : ` ${senderLabel(l.from)}: ${l.text}${l.pending ? " …" : ""}`}
+                  <Text color={C.muted}>{" <"}</Text>
+                  <Text {...nickProps(senderLabel(l.from), isMine(l.from))}>
+                    {senderLabel(l.from)}
+                  </Text>
+                  <Text color={C.muted}>{"> "}</Text>
+                  <Text color={C.fg}>
+                    {l.undecryptable ? "[can't decrypt]" : `${l.text}${l.pending ? " …" : ""}`}
+                  </Text>
                 </Text>
               ))
             )}
           </>
         ) : (
-          <Text dimColor> Select a thread (↑↓, Enter) or use /dm &lt;user&gt;.</Text>
+          <Text color={C.muted2}> Select a thread (↑↓, Enter) or use /dm &lt;user&gt;.</Text>
         )}
       </Box>
       {/* thread list */}
@@ -1186,21 +1462,24 @@ export function DmsBody({
         flexDirection="column"
         width={sidebarWidth}
         borderStyle="single"
-        borderColor="gray"
+        borderColor={C.line}
         borderTop={false}
         borderRight={false}
         borderBottom={false}
       >
-        <Text bold> Threads</Text>
+        <Text color={C.muted}> QUERIES</Text>
         {threads.length === 0 ? (
-          <Text dimColor> — none — /dm user</Text>
+          <Text color={C.muted2}> — none — /dm user</Text>
         ) : (
           threads.map((t, i) => {
             const isActive = i === sel;
-            const badge = t.unread > 0 ? ` ●${t.unread}` : "";
             return (
-              <Text key={t.peer} {...(isActive ? { color: "green", bold: true } : {})}>
-                {`${isActive ? "›" : " "}${t.displayName ?? t.peer}${badge}`}
+              <Text key={t.peer}>
+                <Text color={C.accent}>{isActive ? "›" : " "}</Text>
+                <Text {...nickProps(t.displayName ?? t.peer, isActive)}>
+                  {t.displayName ?? t.peer}
+                </Text>
+                {t.unread > 0 && <Text color={C.accent} bold>{` ${G.online}${t.unread}`}</Text>}
               </Text>
             );
           })
@@ -1221,7 +1500,7 @@ function DmHeader({
 }): React.ReactElement {
   if (keyStatus === "changed") {
     return (
-      <Text color="red" bold>
+      <Text color={C.danger} bold>
         {" ⚠ safety number changed — re-verify before trusting new messages"}
       </Text>
     );
@@ -1230,20 +1509,33 @@ function DmHeader({
   // only check half the bits, re-opening the birthday-collision hole the 16-word (128-bit)
   // number closes (docs/DMS.md). Ink wraps the words within the pane.
   const words = safetyWords.join(" ");
-  return <Text dimColor>{` 🔒 E2E · verify all ${safetyWords.length} words match: ${words}`}</Text>;
+  return (
+    <Text
+      color={C.muted2}
+    >{` 🔒 e2e-encrypted · verify all ${safetyWords.length} words match: ${words}`}</Text>
+  );
 }
 
+/** One lounge transcript row: an irssi-style `HH:MM <nick> message`, or a system
+ *  `HH:MM -!- text` notice in muted grey. Nicks hash to a stable "wire" color. */
 function ChatRow({ line, self }: { line: ChatLine; self: string | null }): React.ReactElement {
+  const time = hhmm(line.ts);
   if (line.kind === "system") {
-    return <Text dimColor>* {line.text}</Text>;
+    return (
+      <Text>
+        <Text color={C.muted2}>{`${time} -!- `}</Text>
+        <Text color={C.muted2}>{line.text}</Text>
+      </Text>
+    );
   }
   const isSelf = line.from != null && line.from === self;
   return (
     <Text>
-      <Text color={isSelf ? SELF_COLOR : "cyan"} bold={isSelf}>
-        {line.from}
-      </Text>
-      <Text>: {line.text}</Text>
+      <Text color={C.muted2}>{`${time} `}</Text>
+      <Text color={C.muted}>{"<"}</Text>
+      <Text {...nickProps(line.from ?? "", isSelf)}>{line.from}</Text>
+      <Text color={C.muted}>{"> "}</Text>
+      <Text color={C.fg}>{line.text}</Text>
     </Text>
   );
 }

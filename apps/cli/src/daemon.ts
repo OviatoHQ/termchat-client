@@ -2,6 +2,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   AUTH_SUBPROTOCOL,
+  type PresenceCounts as Counts,
   DmNotify,
   OnlineResponse,
   PING,
@@ -15,13 +16,40 @@ import {
   readCredentials,
   resolveEdge,
 } from "./config.ts";
-import { writeCounts } from "./line.ts";
+import { readCallState, renderCallLine, writeCounts, writeOnlineLine } from "./line.ts";
 import { crossedExpertAvailable, notifyDmReceived, notifyExpertAvailable } from "./notify.ts";
 
 const PING_INTERVAL_MS = 25_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 const WARM_TIMEOUT_MS = 2_000;
+const METER_INTERVAL_MS = 1_000;
+
+// Latest presence counts + whether an in-call meter is currently owning the line. The
+// daemon is the sole writer of `online.line`: it renders the idle presence line on
+// snapshots, and — while the TUI has recorded an active call (call.json) — ticks the
+// in-call meter each second instead, restoring the idle line once when the call ends.
+let lastCounts: Counts = { online: 0, waiting: 0, experts: 0 };
+let meterActive = false;
+
+/** Write the idle presence line, but never clobber a live meter mid-call. */
+function writeIdleUnlessInCall(counts: Counts): void {
+  lastCounts = counts;
+  if (readCallState() === null) writeCounts(counts);
+}
+
+/** One meter tick: render the in-call line while a call is live; the instant it ends,
+ *  restore the idle presence line exactly once. Cheap no-op when idle. */
+function meterTick(): void {
+  const call = readCallState();
+  if (call) {
+    meterActive = true;
+    writeOnlineLine(renderCallLine(call));
+  } else if (meterActive) {
+    meterActive = false;
+    writeCounts(lastCounts);
+  }
+}
 
 /** Is a live presence daemon already holding the socket for this machine? */
 export function isDaemonRunning(): boolean {
@@ -86,6 +114,8 @@ export async function runDaemon(): Promise<void> {
 
   await warm(httpBase);
   connect(`${wsBase}/ws?clientId=${encodeURIComponent(clientId)}`, protocols);
+  // Tick the in-call meter once a second (reads call.json the TUI records; no network).
+  setInterval(meterTick, METER_INTERVAL_MS);
   // The open WebSocket + ping timer keep the event loop alive indefinitely.
 }
 
@@ -95,7 +125,7 @@ async function warm(httpBase: string): Promise<void> {
     const res = await fetch(`${httpBase}/online`, { signal: AbortSignal.timeout(WARM_TIMEOUT_MS) });
     if (!res.ok) return;
     const parsed = OnlineResponse.safeParse(await res.json());
-    if (parsed.success) writeCounts(parsed.data);
+    if (parsed.success) writeIdleUnlessInCall(parsed.data);
   } catch {
     // Edge not up yet — the WS stream will fill the line in shortly.
   }
@@ -140,7 +170,7 @@ function connect(url: string, protocols?: string[]): void {
     }
     const parsed = PresenceSnapshot.safeParse(value);
     if (!parsed.success) return;
-    writeCounts(parsed.data);
+    writeIdleUnlessInCall(parsed.data);
     // Cross-agent "expert available" surface (the §3B notification, agent-neutral):
     // fire a best-effort, non-blocking desktop notification when an expert first
     // becomes available. Carries no content (the snapshot has only counts) → §11.3-safe.

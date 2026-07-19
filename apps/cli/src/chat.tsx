@@ -1,5 +1,6 @@
 import { RoomName } from "@termchat/protocol";
 import { render } from "ink";
+import { checkToken } from "./auth.ts";
 import { getOrCreateClientId, readCredentials, resolveEdge } from "./config.ts";
 import { type DmController, createDmController } from "./dm-controller.ts";
 import { LoungeClient } from "./lounge-client.ts";
@@ -12,8 +13,24 @@ import { App } from "./tui/App.tsx";
  */
 export async function runChat(roomArg: string | undefined): Promise<void> {
   const { httpBase, wsBase } = resolveEdge();
-  const credentials = readCredentials();
+  const stored = readCredentials();
   const clientId = getOrCreateClientId();
+
+  // Revalidate the stored token against the CURRENT edge before trusting it. A
+  // token minted on a different environment (staging vs prod → different
+  // AUTH_SECRETs) won't verify here — so joining with it just yields a silent
+  // guest handle while the client thinks it's "signed in". On a hard rejection we
+  // drop to a clean guest + a clear prompt; a network blip keeps the token
+  // (offline-tolerant), so you're never logged out by a transient failure.
+  let credentials = stored;
+  let notice: string | undefined;
+  if (stored) {
+    const status = await checkToken(httpBase, stored.token);
+    if (status.state === "rejected") {
+      credentials = null;
+      notice = `Your saved session isn't valid on ${httpBase.replace(/^https?:\/\//, "")} — run /login to sign in here.`;
+    }
+  }
 
   const parsedRoom = RoomName.safeParse(roomArg ?? "general");
   const room = parsedRoom.success ? parsedRoom.data : "general";
@@ -48,6 +65,7 @@ export async function runChat(roomArg: string | undefined): Promise<void> {
       session={{ wsBase, httpBase, clientId }}
       {...(marketplace ? { marketplace } : {})}
       {...(dmController ? { dmController } : {})}
+      {...(notice ? { notice } : {})}
     />,
   );
   await waitUntilExit();

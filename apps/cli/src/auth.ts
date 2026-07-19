@@ -3,6 +3,7 @@ import {
   PairStartResponse,
   SessionClaims,
   type StoredCredentials,
+  WhoAmI,
 } from "@termchat/protocol";
 import { clearCredentials, readCredentials, resolveEdge, writeCredentials } from "./config.ts";
 
@@ -155,33 +156,64 @@ export function logout(): void {
   console.log("Logged out.");
 }
 
+/** The outcome of validating a stored token against a SPECIFIC edge. */
+export type TokenStatus =
+  | { state: "valid"; who: WhoAmI }
+  /** 401 — the edge rejected the token: it was minted against a *different*
+   *  environment (staging vs prod have different AUTH_SECRETs) or it expired. */
+  | { state: "rejected" }
+  /** Network error / timeout / 5xx — we couldn't confirm. Callers should KEEP
+   *  trusting the local token (offline-tolerant), not log the user out on a blip. */
+  | { state: "unreachable" };
+
+/**
+ * Ask `<edge>/auth/me` whether a token is valid *for that edge*. This is the check
+ * that distinguishes "logged in here" from "have a credentials file from somewhere
+ * else" — the trap that shows a signed-in user a random guest handle when their
+ * client points at an edge their token wasn't minted for.
+ */
+export async function checkToken(httpBase: string, token: string): Promise<TokenStatus> {
+  try {
+    const res = await fetch(`${httpBase}/auth/me`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(2_500),
+    });
+    if (res.status === 401) return { state: "rejected" };
+    if (!res.ok) return { state: "unreachable" };
+    const parsed = WhoAmI.safeParse(await res.json());
+    return parsed.success ? { state: "valid", who: parsed.data } : { state: "unreachable" };
+  } catch {
+    return { state: "unreachable" };
+  }
+}
+
+const host = (httpBase: string): string => httpBase.replace(/^https?:\/\//, "");
+
 export async function whoami(): Promise<void> {
   const credentials = readCredentials();
   if (!credentials) {
     console.log("Not logged in. Run `termchat login`.");
     return;
   }
-  // Prefer a server-side confirmation; fall back to a local token decode offline.
   const { httpBase } = resolveEdge();
-  try {
-    const res = await fetch(`${httpBase}/auth/me`, {
-      headers: { authorization: `Bearer ${credentials.token}` },
-      signal: AbortSignal.timeout(2_000),
-    });
-    if (res.ok) {
-      const me = (await res.json()) as { githubLogin?: string; verified?: boolean };
-      console.log(`Logged in as ${me.githubLogin} (verified: ${me.verified === true}).`);
-      return;
-    }
-    if (res.status === 401) {
-      console.log("Session expired. Run `termchat login`.");
-      return;
-    }
-  } catch {
-    // offline — fall through to local decode
+  const status = await checkToken(httpBase, credentials.token);
+  if (status.state === "valid") {
+    console.log(
+      `Logged in as ${status.who.githubLogin} (verified: ${status.who.verified === true}).`,
+    );
+    return;
   }
+  if (status.state === "rejected") {
+    console.log(
+      `Your saved session isn't valid on ${host(httpBase)} (different server or expired). Run \`termchat login\`.`,
+    );
+    return;
+  }
+  // Unreachable (offline) — fall back to a local, unverified decode.
   const claims = decodeToken(credentials.token);
-  console.log(`Logged in as ${claims?.gh ?? credentials.githubLogin} (offline).`);
+  console.log(
+    `Logged in as ${claims?.gh ?? credentials.githubLogin} (offline — couldn't reach ${host(httpBase)}).`,
+  );
 }
 
 /** Decode (without verifying) the claims of a session token, for display. */

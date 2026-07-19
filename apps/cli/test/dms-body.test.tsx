@@ -68,7 +68,7 @@ test("an open thread shows the conversation and the safety-number header", () =>
   };
   const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn sidebarWidth={20} />);
   const frame = lastFrame() ?? "";
-  expect(frame).toContain("@bob");
+  expect(frame).toContain("query with bob");
   expect(frame).toContain("yo bro ssup");
   expect(frame).toContain("verify all 16 words");
   expect(frame).toContain("anchor"); // first word
@@ -111,8 +111,8 @@ test("shows display names (nick) as labels while keying by the stable handle", (
   };
   const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn sidebarWidth={20} />);
   const frame = lastFrame() ?? "";
-  expect(frame).toContain("@chef"); // header uses the display name
-  expect(frame).toContain("chef: hey there"); // peer message labelled by display name
-  expect(frame).toContain("me: yo"); // my own message stays "me"
+  expect(frame).toContain("query with chef"); // header uses the display name
+  expect(frame).toContain("<chef> hey there"); // peer message labelled by display name
+  expect(frame).toContain("<me> yo"); // my own message stays "me"
   expect(frame).not.toContain("shafiu"); // the raw handle is never surfaced
 });

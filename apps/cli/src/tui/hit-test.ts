@@ -10,9 +10,9 @@
  * tab's body starts at row 3. Every body line is exactly one row tall, so row math
  * is deterministic. These constants MUST track the render in App.tsx.
  */
-import { TABS, TAB_LABELS, type TabId } from "./nav.ts";
+import { type TabId, windowStripCells } from "./nav.ts";
 
-/** 1-based row of the tab strip (title bar is row 1). */
+/** 1-based row of the window strip (title/status bar is row 1). */
 export const TAB_ROW = 2;
 /** 1-based first row of the active tab's body. */
 export const BODY_TOP = 3;
@@ -49,20 +49,24 @@ export interface HitTestView {
   activeTab: TabId;
   /** Terminal width, for full-row click targets. */
   cols: number;
+  /** Total unread DMs — the window strip appends a `(N!)` badge that widens the DMs
+   *  cell, so hit-testing must know it to keep later cells aligned. */
+  dmUnread: number;
   expertsCount: number;
   meCount: number;
   bountiesCount: number;
   sessionsCount: number;
 }
 
-/** The tab strip's clickable cells. Widths are independent of which tab is active
- *  (active `[Label] ` and inactive ` Label  ` are the same width), so this is stable. */
-export function tabRegions(): Region[] {
+/** The window strip's clickable cells. Built from the SAME `windowStripCells` the
+ *  renderer draws, so the numbered `[3:experts]`/` 2:dms ` widths (including the DMs
+ *  unread badge) always line up with what's on screen. */
+export function tabRegions(activeTab: TabId, dmUnread: number): Region[] {
   const regions: Region[] = [];
   let x = 1;
-  for (const tab of TABS) {
-    const w = TAB_LABELS[tab].length + 3;
-    regions.push({ x, y: TAB_ROW, w, h: 1, target: { kind: "tab", tab } });
+  for (const cell of windowStripCells(activeTab, dmUnread)) {
+    const w = cell.text.length;
+    regions.push({ x, y: TAB_ROW, w, h: 1, target: { kind: "tab", tab: cell.tab } });
     x += w;
   }
   return regions;
@@ -106,7 +110,7 @@ export function bodyRegions(view: HitTestView): Region[] {
 
 /** All clickable regions for the current view, in draw order. */
 export function regionsForView(view: HitTestView): Region[] {
-  return [...tabRegions(), ...bodyRegions(view)];
+  return [...tabRegions(view.activeTab, view.dmUnread), ...bodyRegions(view)];
 }
 
 /** Find the target at `(x,y)`, if any. Later regions win (an inner control beats the

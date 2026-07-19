@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decodeToken } from "../src/auth.ts";
+import { checkToken, decodeToken } from "../src/auth.ts";
 import {
   clearCredentials,
   credentialsPath,
@@ -115,5 +115,46 @@ test("login exchanges the pasted browser code and stores credentials", async () 
     expect(stored.token).toBe(token);
   } finally {
     server.stop(true);
+  }
+});
+
+test("checkToken: valid WhoAmI from the edge → { state: 'valid' }", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({ user: "u", githubLogin: "u", verified: true, exp: 9_999_999_999 }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      },
+    )) as unknown as typeof fetch;
+  try {
+    const r = await checkToken("https://edge.example", "tok");
+    expect(r.state).toBe("valid");
+    if (r.state === "valid") expect(r.who.githubLogin).toBe("u");
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("checkToken: 401 from the edge → 'rejected' (wrong env / expired)", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("", { status: 401 })) as unknown as typeof fetch;
+  try {
+    expect((await checkToken("https://edge.example", "tok")).state).toBe("rejected");
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test("checkToken: network failure → 'unreachable' (never logs you out on a blip)", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error("offline");
+  }) as unknown as typeof fetch;
+  try {
+    expect((await checkToken("https://edge.example", "tok")).state).toBe("unreachable");
+  } finally {
+    globalThis.fetch = orig;
   }
 });

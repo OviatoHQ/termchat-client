@@ -21,6 +21,28 @@ export const TAB_LABELS: Record<TabId, string> = {
   me: "Me",
 };
 
+/** One cell of the irssi-style numbered window strip (design 2a). SINGLE source of
+ *  truth for the strip: both the renderer (App.tsx) and the click hit-tester
+ *  (hit-test.ts) build from this so their widths can never drift. The active window is
+ *  bracketed `[3:experts]`; inactive ones ` 2:dms `; DMs appends an unread badge `(2!)`. */
+export interface WindowCell {
+  tab: TabId;
+  /** Exact rendered text, including the surrounding brackets/spaces (width-significant). */
+  text: string;
+  active: boolean;
+  unread: boolean;
+}
+
+export function windowStripCells(activeTab: TabId, dmUnread: number): WindowCell[] {
+  return TABS.map((t, i) => {
+    const active = t === activeTab;
+    const unread = t === "dms" && dmUnread > 0;
+    const badge = unread ? `(${dmUnread}!)` : "";
+    const text = active ? `[${i + 1}:${t}${badge}]` : ` ${i + 1}:${t}${badge} `;
+    return { tab: t, text, active, unread };
+  });
+}
+
 /** The subset of Ink's key flags the reducer reads (all optional booleans). */
 export interface KeyLike {
   tab?: boolean;

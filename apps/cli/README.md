@@ -7,7 +7,7 @@ login, and the safe `settings.json` installer.
 
 ```sh
 # curl bootstrap (ensures Bun, wires Claude Code hooks safely):
-curl -fsSL https://termchat.dev/install.sh | sh
+curl -fsSL https://termchat.sh/install.sh | sh
 
 # or Homebrew (once the tap is published — see Formula/termchat.rb):
 brew install oviatohq/termchat/termchat

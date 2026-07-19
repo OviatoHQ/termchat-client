@@ -96,9 +96,10 @@ export function parseCommand(input: string): Command | null {
       return { kind: "onboard" };
     case "expert":
       return parseExpert(rest);
+    case "call":
     case "summon": {
-      // /summon [@handle] <maxRate> <problem…>
-      // A leading @handle targets ONE named expert directly; without it, the summon
+      // /call [@handle] <maxRate> <problem…>   (/summon is a legacy alias)
+      // A leading @handle targets ONE named expert directly; without it, the call
       // is the open topic/rate auction. The @ sigil is required to disambiguate a
       // handle from a (malformed) rate. The rate cap applies in both forms.
       let parts = rest;
@@ -107,7 +108,7 @@ export function parseCommand(input: string): Command | null {
         target = parts[0].slice(1).trim();
         parts = parts.slice(1);
         if (!target) {
-          return { kind: "invalid", reason: "usage: /summon @<handle> <maxRate> <problem>" };
+          return { kind: "invalid", reason: "usage: /call @<handle> <maxRate> <problem>" };
         }
       }
       const maxRate = Number.parseFloat(parts[0] ?? "");
@@ -115,7 +116,7 @@ export function parseCommand(input: string): Command | null {
       if (!Number.isFinite(maxRate) || !problem) {
         return {
           kind: "invalid",
-          reason: "usage: /summon [@handle] <maxRate> <problem>",
+          reason: "usage: /call [@handle] <maxRate> <problem>",
         };
       }
       return target
@@ -123,11 +124,16 @@ export function parseCommand(input: string): Command | null {
         : { kind: "summon", maxRate, problem };
     }
     case "accept":
-      // A numeric arg is a bounty id; a UUID (or bare) is a summon offer.
-      if (rest[0] && /^\d+$/.test(rest[0])) {
-        return { kind: "bounty_accept", bountyId: Number.parseInt(rest[0], 10) };
-      }
+      // Real-time call offer only. Bounty answers are approved with /approve.
       return rest[0] ? { kind: "accept", reqId: rest[0] } : { kind: "accept" };
+    case "approve": {
+      // /approve <bountyId> — the seeker approves a delivered bounty answer.
+      const bountyId = Number.parseInt(rest[0] ?? "", 10);
+      if (!Number.isInteger(bountyId) || bountyId <= 0) {
+        return { kind: "invalid", reason: "usage: /approve <bountyId>" };
+      }
+      return { kind: "bounty_accept", bountyId };
+    }
     case "decline":
       return rest[0] ? { kind: "decline", reqId: rest[0] } : { kind: "decline" };
     case "end":

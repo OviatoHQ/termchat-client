@@ -14,6 +14,7 @@ import {
 const view = (over: Partial<Parameters<typeof bodyRegions>[0]>) => ({
   activeTab: "lounge" as const,
   cols: 80,
+  dmUnread: 0,
   expertsCount: 0,
   meCount: 0,
   bountiesCount: 0,
@@ -21,8 +22,8 @@ const view = (over: Partial<Parameters<typeof bodyRegions>[0]>) => ({
   ...over,
 });
 
-test("tabRegions lays the six tabs left-to-right on the tab row", () => {
-  const regions = tabRegions();
+test("tabRegions lays the six numbered windows left-to-right on the strip", () => {
+  const regions = tabRegions("lounge", 0);
   expect(regions.map((r) => r.target)).toEqual([
     { kind: "tab", tab: "lounge" },
     { kind: "tab", tab: "dms" },
@@ -31,27 +32,34 @@ test("tabRegions lays the six tabs left-to-right on the tab row", () => {
     { kind: "tab", tab: "calls" },
     { kind: "tab", tab: "me" },
   ]);
-  // Lounge (6+3=9) at x=1; DMs (3+3=6) at x=10; Experts (7+3=10) at x=16.
-  expect(regions[0]).toMatchObject({ x: 1, y: TAB_ROW, w: 9 });
-  expect(regions[1]).toMatchObject({ x: 10, y: TAB_ROW, w: 6 });
-  expect(regions[2]).toMatchObject({ x: 16, y: TAB_ROW, w: 10 });
+  // `[1:lounge]` (10) at x=1; ` 2:dms ` (7) at x=11; ` 3:experts ` (11) at x=18.
+  expect(regions[0]).toMatchObject({ x: 1, y: TAB_ROW, w: 10 });
+  expect(regions[1]).toMatchObject({ x: 11, y: TAB_ROW, w: 7 });
+  expect(regions[2]).toMatchObject({ x: 18, y: TAB_ROW, w: 11 });
   // Tabs are contiguous, no gaps.
   for (let i = 1; i < regions.length; i++) {
     expect(regions[i]?.x).toBe((regions[i - 1]?.x ?? 0) + (regions[i - 1]?.w ?? 0));
   }
 });
 
-test("clicking the tab row routes to the right tab", () => {
-  const regions = tabRegions();
-  expect(hitTest(regions, 1, TAB_ROW)).toEqual({ kind: "tab", tab: "lounge" });
-  expect(hitTest(regions, 10, TAB_ROW)).toEqual({ kind: "tab", tab: "dms" });
-  expect(hitTest(regions, 16, TAB_ROW)).toEqual({ kind: "tab", tab: "experts" });
-  expect(hitTest(regions, 26, TAB_ROW)).toEqual({ kind: "tab", tab: "bounties" });
-  expect(hitTest(regions, 45, TAB_ROW)).toEqual({ kind: "tab", tab: "me" });
+test("the DMs unread badge widens its cell and shifts the ones after it", () => {
+  const plain = tabRegions("lounge", 0);
+  const badged = tabRegions("lounge", 2); // ` 2:dms(2!) ` is 4 cells wider
+  expect(badged[1]?.w).toBe((plain[1]?.w ?? 0) + 4);
+  expect(badged[2]?.x).toBe((plain[2]?.x ?? 0) + 4);
 });
 
-test("a click off the tab row (wrong y) misses every tab", () => {
-  expect(hitTest(tabRegions(), 1, TAB_ROW + 5)).toBeUndefined();
+test("clicking the window strip routes to the right window", () => {
+  const regions = tabRegions("lounge", 0);
+  expect(hitTest(regions, 1, TAB_ROW)).toEqual({ kind: "tab", tab: "lounge" });
+  expect(hitTest(regions, 11, TAB_ROW)).toEqual({ kind: "tab", tab: "dms" });
+  expect(hitTest(regions, 18, TAB_ROW)).toEqual({ kind: "tab", tab: "experts" });
+  expect(hitTest(regions, 29, TAB_ROW)).toEqual({ kind: "tab", tab: "bounties" });
+  expect(hitTest(regions, 50, TAB_ROW)).toEqual({ kind: "tab", tab: "me" });
+});
+
+test("a click off the window strip (wrong y) misses every window", () => {
+  expect(hitTest(tabRegions("lounge", 0), 1, TAB_ROW + 5)).toBeUndefined();
 });
 
 test("Experts body: one full-width row per expert, starting below the header", () => {

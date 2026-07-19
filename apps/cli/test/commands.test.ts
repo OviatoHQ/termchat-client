@@ -40,13 +40,19 @@ test("parses marketplace commands", () => {
     topics: ["rust", "go"],
   });
   expect(parseCommand("/expert off")).toEqual({ kind: "expert", on: false, topics: [] });
+  expect(parseCommand("/call 5 borrow checker help")).toEqual({
+    kind: "summon",
+    maxRate: 5,
+    problem: "borrow checker help",
+  });
+  // /summon stays as a legacy alias for /call, parsing to the same kind.
   expect(parseCommand("/summon 5 borrow checker help")).toEqual({
     kind: "summon",
     maxRate: 5,
     problem: "borrow checker help",
   });
-  // Targeted summon: a leading @handle addresses one named expert; rate cap still applies.
-  expect(parseCommand("/summon @chef 5 borrow checker help")).toEqual({
+  // Targeted call: a leading @handle addresses one named expert; rate cap still applies.
+  expect(parseCommand("/call @chef 5 borrow checker help")).toEqual({
     kind: "summon",
     maxRate: 5,
     problem: "borrow checker help",
@@ -75,15 +81,17 @@ test("parses marketplace commands", () => {
     bountyId: 12,
     answer: "use Arc not Rc",
   });
-  expect(parseCommand("/accept 12")).toEqual({ kind: "bounty_accept", bountyId: 12 }); // numeric → bounty
-  expect(parseCommand("/accept")).toEqual({ kind: "accept" }); // bare → summon
+  expect(parseCommand("/approve 12")).toEqual({ kind: "bounty_accept", bountyId: 12 }); // bounty answer
+  expect(parseCommand("/accept 12")).toEqual({ kind: "accept", reqId: "12" }); // call offer, no numeric overload
+  expect(parseCommand("/accept")).toEqual({ kind: "accept" }); // bare → call offer
   expect(parseCommand("/reject 12")).toEqual({ kind: "bounty_reject", bountyId: 12 });
 });
 
 test("rejects malformed marketplace commands with a usage hint", () => {
-  expect(parseCommand("/summon notanumber")).toMatchObject({ kind: "invalid" });
-  expect(parseCommand("/summon @chef")).toMatchObject({ kind: "invalid" }); // handle but no rate/problem
-  expect(parseCommand("/summon @ 5 help")).toMatchObject({ kind: "invalid" }); // empty handle
+  expect(parseCommand("/call notanumber")).toMatchObject({ kind: "invalid" });
+  expect(parseCommand("/call @chef")).toMatchObject({ kind: "invalid" }); // handle but no rate/problem
+  expect(parseCommand("/call @ 5 help")).toMatchObject({ kind: "invalid" }); // empty handle
+  expect(parseCommand("/approve notanumber")).toMatchObject({ kind: "invalid" });
   expect(parseCommand("/expert on")).toMatchObject({ kind: "invalid" });
   expect(parseCommand("/review 9")).toMatchObject({ kind: "invalid" });
   expect(parseCommand("/dispute notanumber")).toMatchObject({ kind: "invalid" });

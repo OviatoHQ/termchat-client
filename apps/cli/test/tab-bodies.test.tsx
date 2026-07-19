@@ -1,7 +1,13 @@
 import { expect, test } from "bun:test";
 import type { BountyCard, ExpertCard, SessionCard } from "@termchat/protocol";
 import { render } from "ink-testing-library";
-import { BountiesBody, CallsBody, ExpertsBody, MeBody } from "../src/tui/App.tsx";
+import {
+  BountiesBody,
+  CallsBody,
+  ExpertsBody,
+  MeBody,
+  SummonConfirmBody,
+} from "../src/tui/App.tsx";
 import {
   BOUNTIES_LIST_OFFSET,
   CALLS_LIST_OFFSET,
@@ -40,7 +46,7 @@ test("layout: first expert row sits at EXPERTS_LIST_OFFSET below the body top", 
     render(<ExpertsBody experts={[card({ user: "zzmarker" })]} sel={0} signedIn />).lastFrame() ??
     ""
   ).split("\n");
-  expect(lines[0]).toContain("Experts"); // header on line 0
+  expect(lines[0]).toContain("EXPERTS"); // header on line 0
   expect(lines[EXPERTS_LIST_OFFSET]).toContain("zzmarker");
 });
 
@@ -50,7 +56,7 @@ test("layout: first Me action sits at ME_LIST_OFFSET below the body top", () => 
       <MeBody actions={[{ label: "zzmarker-action" }]} sel={0} user="alice" self="alice" />,
     ).lastFrame() ?? ""
   ).split("\n");
-  expect(lines[0]).toContain("Me"); // header on line 0
+  expect(lines[0]).toContain("ME"); // header on line 0
   expect(lines[ME_LIST_OFFSET]).toContain("zzmarker-action");
 });
 
@@ -59,10 +65,10 @@ test("ExpertsBody: online expert renders dot, topics, rate, rating, and a Summon
   const frame = lastFrame() ?? "";
   expect(frame).toContain("●"); // online dot
   expect(frame).toContain("dana");
-  expect(frame).toContain("rust, wasm");
+  expect(frame).toContain("rust wasm");
   expect(frame).toContain("$2/min");
   expect(frame).toContain("★4.9 (37)");
-  expect(frame).toContain("[ Summon ]");
+  expect(frame).toContain("call"); // lime call chip
   expect(frame).toContain("›"); // selected-row marker
 });
 
@@ -72,7 +78,7 @@ test("ExpertsBody: offline expert gets a hollow dot and a Bounty CTA", () => {
   );
   const frame = lastFrame() ?? "";
   expect(frame).toContain("○"); // offline dot
-  expect(frame).toContain("[ Bounty ]");
+  expect(frame).toContain("[bounty]");
 });
 
 test("ExpertsBody: unrated expert shows '★ new'; topExpert shows the star badge", () => {
@@ -88,11 +94,28 @@ test("ExpertsBody: unrated expert shows '★ new'; topExpert shows the star badg
   expect(frame).toContain("⭐");
 });
 
+test("SummonConfirmBody: spells out the hold (rate × 30-min cap) + the typed problem", () => {
+  const frame =
+    render(
+      <SummonConfirmBody
+        expert={card({ user: "dana", rate: 2, topExpert: true })}
+        problem="borrow checker fight"
+        cursorOn={true}
+      />,
+    ).lastFrame() ?? "";
+  expect(frame).toContain("SUMMON DANA"); // confirm header
+  expect(frame).toContain("$2/min"); // the rate (amber)
+  expect(frame).toContain("$60.00 max"); // hold = rate × 30-min cap
+  expect(frame).toContain("borrow checker fight"); // the problem input echoes the draft
+  expect(frame).toContain("authorize $60.00 hold");
+  expect(frame).toContain("[cancel]");
+});
+
 test("ExpertsBody: signed-out shows a sign-in prompt, not the list", () => {
   const { lastFrame } = render(<ExpertsBody experts={[card({})]} sel={0} signedIn={false} />);
   const frame = lastFrame() ?? "";
   expect(frame).toContain("Sign in");
-  expect(frame).not.toContain("[ Summon ]");
+  expect(frame).not.toContain("$2/min"); // the expert rows aren't rendered
 });
 
 test("ExpertsBody: empty list shows a quiet placeholder", () => {
@@ -105,7 +128,7 @@ test("layout: first bounty row sits at BOUNTIES_LIST_OFFSET below the body top",
     render(<BountiesBody bounties={[bounty({ bountyId: 77 })]} sel={0} signedIn />).lastFrame() ??
     ""
   ).split("\n");
-  expect(lines[0]).toContain("Bounties"); // header on line 0
+  expect(lines[0]).toContain("BOUNTIES"); // header on line 0
   expect(lines[BOUNTIES_LIST_OFFSET]).toContain("#77");
 });
 
@@ -115,18 +138,18 @@ test("BountiesBody: open bounty shows id, price, topic, question, and a Claim CT
   expect(frame).toContain("$3.00");
   expect(frame).toContain("rust");
   expect(frame).toContain("borrow checker");
-  expect(frame).toContain("[ Claim ]");
-  expect(frame).toContain("[ Post a bounty ]"); // the post action always follows
+  expect(frame).toContain("[claim]");
+  expect(frame).toContain("[post a bounty]"); // the post action always follows
 });
 
 test("BountiesBody: empty board still offers Post; signed-out shows a prompt", () => {
   const empty = render(<BountiesBody bounties={[]} sel={0} signedIn />).lastFrame() ?? "";
   expect(empty).toContain("No open bounties");
-  expect(empty).toContain("[ Post a bounty ]");
+  expect(empty).toContain("[post a bounty]");
   const guest =
     render(<BountiesBody bounties={[bounty({})]} sel={0} signedIn={false} />).lastFrame() ?? "";
   expect(guest).toContain("Sign in");
-  expect(guest).not.toContain("[ Claim ]");
+  expect(guest).not.toContain("[claim]");
 });
 
 const sessionCard = (over: Partial<SessionCard>): SessionCard => ({
@@ -146,10 +169,10 @@ const sessionCard = (over: Partial<SessionCard>): SessionCard => ({
 test("CallsBody: active-session line reflects state; signed-out shows a prompt", () => {
   expect(
     render(<CallsBody active={null} sessions={[]} sel={0} signedIn />).lastFrame() ?? "",
-  ).toContain("No active call");
+  ).toContain("no active call");
   expect(
     render(<CallsBody active={7} sessions={[]} sel={0} signedIn />).lastFrame() ?? "",
-  ).toContain("Active: session #7");
+  ).toContain("session #7 live");
   expect(
     render(<CallsBody active={null} sessions={[]} sel={0} signedIn={false} />).lastFrame() ?? "",
   ).toContain("Sign in");
@@ -181,7 +204,7 @@ test("layout: first Calls session row sits at CALLS_LIST_OFFSET below the body t
       <CallsBody active={null} sel={0} signedIn sessions={[sessionCard({ sessionId: 77 })]} />,
     ).lastFrame() ?? ""
   ).split("\n");
-  expect(lines[0]).toContain("Calls"); // header on line 0
+  expect(lines[0]).toContain("CALLS"); // header on line 0
   expect(lines[CALLS_LIST_OFFSET]).toContain("#77");
 });
 
@@ -190,10 +213,10 @@ test("MeBody: guest lists Log in; signed-in header shows the handle", () => {
     <MeBody actions={[{ label: "Log in with GitHub" }]} sel={0} user={null} self="brave-otter" />,
   );
   expect(guest.lastFrame() ?? "").toContain("Log in with GitHub");
-  expect(guest.lastFrame() ?? "").toContain("Guest: brave-otter");
+  expect(guest.lastFrame() ?? "").toContain("guest: brave-otter");
 
   const signedIn = render(
     <MeBody actions={[{ label: "Log out" }]} sel={0} user="alice" self="alice" />,
   );
-  expect(signedIn.lastFrame() ?? "").toContain("Signed in as alice ✓");
+  expect(signedIn.lastFrame() ?? "").toContain("alice ✓");
 });

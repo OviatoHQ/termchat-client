@@ -1,9 +1,14 @@
-import { renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { PresenceCounts } from "@termchat/protocol";
-import { ensureHome, onlineLinePath } from "./config.ts";
+import { ensureHome, onlineLinePath, termchatHome } from "./config.ts";
 
-const GREEN = "\x1b[32m";
-const DIM = "\x1b[2m";
+// Truecolor "wire" olive escapes (see apps/cli/src/tui/theme.ts — same hex values).
+// Claude Code's status bar renders truecolor; NO_COLOR strips all of these.
+const LIME = "\x1b[38;2;202;219;106m"; // --accent: presence dot, signal
+const AMBER = "\x1b[38;2;217;169;78m"; // --amber: money only (⚡, rates, cost)
+const FG = "\x1b[38;2;201;197;160m"; // --fg: counts
+const MUTED = "\x1b[38;2;119;117;79m"; // --muted: separators, brand word
 const RESET = "\x1b[0m";
 
 /** Respect the NO_COLOR convention (present, any value → disable). PRD §16. */
@@ -17,17 +22,67 @@ function fmt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
+/** `MM:SS` for a connected-minutes elapsed count. */
+function clock(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
 /**
- * Render the ambient status-line string: `💬 chat ● 12 online - 4 expert`. The dot
- * stays green (presence signal); the counts are dim. Online is always shown; waiting
- * and experts only when non-zero (experts is always 0 in Phase 0).
+ * Render the ambient (idle) status line in the "wire" style: `● termchat 37 · ⚡4` —
+ * the dot is lime (presence signal), `termchat` + the online count sit in fg/muted,
+ * and the `⚡`+experts count is amber (money surface). Deliberately minimal: no room
+ * or unread info (docs handoff). Experts is shown only when non-zero.
  */
 export function renderLine(counts: PresenceCounts, color: boolean = useColor()): string {
-  const parts = [`${fmt(counts.online)} online`];
-  if (counts.waiting > 0) parts.push(`${fmt(counts.waiting)} waiting`);
-  if (counts.experts > 0) parts.push(`${fmt(counts.experts)} expert`);
-  const text = parts.join(" - ");
-  return color ? `💬 chat ${GREEN}●${RESET} ${DIM}${text}${RESET}` : `💬 chat ● ${text}`;
+  const online = fmt(counts.online);
+  const experts = counts.experts > 0 ? counts.experts : 0;
+  if (!color) {
+    return experts > 0 ? `▄▀ termchat ${online} · ⚡${experts}` : `▄▀ termchat ${online}`;
+  }
+  // The ▄▀ brand mark (lime ▄ + amber ▀) replaces the presence dot — same two-tone
+  // as the TUI top bar and the web logo's two squares.
+  const mark = `${LIME}▄${AMBER}▀${RESET}`;
+  const head = `${mark} ${MUTED}termchat${RESET} ${FG}${online}${RESET}`;
+  return experts > 0 ? `${head} ${MUTED}·${RESET} ${AMBER}⚡${experts}${RESET}` : head;
+}
+
+/** Live in-call state the seeker's TUI records so the daemon can render the meter.
+ *  Only the coarse peer handle + rate + start time — never prompt/topic/paths. */
+export interface CallState {
+  peer: string;
+  /** Dollars per connected minute. */
+  rate: number;
+  /** Epoch ms when the session opened (the meter's zero). */
+  startedAt: number;
+}
+
+/** How long the transient "accepted · call opening…" line shows before the meter. */
+const ACCEPTED_MS = 3_000;
+
+/**
+ * Render the in-call status line from a recorded {@link CallState} and the current
+ * time. For the first few seconds it reads `⚡ dana accepted · call opening in
+ * browser…`; then it becomes the live meter `⚡ dana 03:12` — peer + elapsed time only.
+ * We deliberately DON'T show a running dollar here: this surface can't see pause or the
+ * audio-connect moment, so a cost would overstate the bill during a pause. The elapsed
+ * clock is honest as "time since the call opened"; the browser call page + the Session
+ * DO remain the authorities for money. Amber marks it as the summon/call surface.
+ */
+export function renderCallLine(
+  call: CallState,
+  now: number = Date.now(),
+  color: boolean = useColor(),
+): string {
+  const elapsedMs = Math.max(0, now - call.startedAt);
+  if (elapsedMs < ACCEPTED_MS) {
+    const plain = `⚡ ${call.peer} accepted · call opening in browser…`;
+    return color ? `${AMBER}${plain}${RESET}` : plain;
+  }
+  const secs = Math.floor(elapsedMs / 1000);
+  if (!color) return `⚡ ${call.peer} ${clock(secs)}`;
+  return `${AMBER}⚡ ${call.peer}${RESET} ${FG}${clock(secs)}${RESET}`;
 }
 
 /**
@@ -45,4 +100,45 @@ export function writeOnlineLine(content: string): void {
 
 export function writeCounts(counts: PresenceCounts): void {
   writeOnlineLine(renderLine(counts));
+}
+
+/** Path to the daemon-read call-state file (`~/.termchat/call.json`). */
+export function callStatePath(): string {
+  return join(termchatHome(), "call.json");
+}
+
+/**
+ * Record (or clear) the active call so the daemon can render the in-call meter across
+ * processes: the TUI writes it on `session_start` and clears it on `session_end`; the
+ * daemon polls it each second while a call is live. Atomic write; a `null` removes it.
+ */
+export function writeCallState(call: CallState | null): void {
+  ensureHome();
+  const dest = callStatePath();
+  if (call === null) {
+    if (existsSync(dest)) rmSync(dest);
+    return;
+  }
+  const tmp = `${dest}.tmp-${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(call)}\n`);
+  renameSync(tmp, dest);
+}
+
+/** Read the active call, or `null` when no call is live (or the file is unreadable). */
+export function readCallState(): CallState | null {
+  const path = callStatePath();
+  if (!existsSync(path)) return null;
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as Partial<CallState>;
+    if (
+      typeof value.peer === "string" &&
+      typeof value.rate === "number" &&
+      typeof value.startedAt === "number"
+    ) {
+      return { peer: value.peer, rate: value.rate, startedAt: value.startedAt };
+    }
+  } catch {
+    // corrupt/partial → treat as no call
+  }
+  return null;
 }

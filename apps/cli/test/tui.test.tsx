@@ -50,9 +50,9 @@ test("renders the lounge chrome, roster, and messages (App seeds from client sta
   const { lastFrame } = render(<App client={client} user="alice" staticInput />);
   const frame = lastFrame() ?? "";
   expect(frame).toContain("termchat");
-  expect(frame).toContain("#rust");
-  expect(frame).toContain("alice ✓ · rust"); // verified roster entry with coarse topic
-  expect(frame).toContain("3 guest(s)");
+  expect(frame).toContain("#RUST"); // roster header for the current room
+  expect(frame).toContain("alice ✓ rust"); // verified roster entry with coarse topic
+  expect(frame).toContain("4 online"); // 1 member + 3 guests in the olive top bar
   expect(frame).toContain("bob");
   expect(frame).toContain("hey alice");
 });
@@ -66,26 +66,26 @@ test("re-renders reactively when a new message arrives after mount", async () =>
   expect(lastFrame() ?? "").toContain("ping");
 });
 
-test("renders the tab strip with Lounge active by default", () => {
+test("renders the numbered window strip with lounge active by default", () => {
   const { client } = setup("alice");
   const { lastFrame } = render(<App client={client} user="alice" staticInput />);
   const frame = lastFrame() ?? "";
-  expect(frame).toContain("[Lounge]"); // active tab is bracketed
-  expect(frame).toContain("DMs"); // the DMs tab (docs/DMS.md stage 3b)
-  expect(frame).toContain("Experts");
-  expect(frame).toContain("Calls");
-  expect(frame).toContain("Me");
+  expect(frame).toContain("[1:lounge]"); // active window is bracketed
+  expect(frame).toContain("2:dms"); // the DMs window (docs/DMS.md stage 3b)
+  expect(frame).toContain("3:experts");
+  expect(frame).toContain("5:calls");
+  expect(frame).toContain("6:me");
 });
 
-// Pin the layout the hit-tester assumes (BODY_TOP=3): title on line 0, tab strip on
-// line 1, so tab clicks at row 2 and bodies from row 3 route correctly. If someone
-// inserts a header line, this fails instead of clicks silently landing a row off.
-test("layout: title is line 0 and the tab strip is line 1 (anchors hit-test rows)", () => {
+// Pin the layout the hit-tester assumes (BODY_TOP=3): the top bar on line 0, the window
+// strip on line 1, so window clicks at row 2 and bodies from row 3 route correctly. If
+// someone inserts a header line, this fails instead of clicks silently landing a row off.
+test("layout: top bar is line 0 and the window strip is line 1 (anchors hit-test rows)", () => {
   const { client } = setup("alice");
   const { lastFrame } = render(<App client={client} user="alice" staticInput />);
   const lines = (lastFrame() ?? "").split("\n");
   expect(lines[0]).toContain("termchat");
-  expect(lines[1]).toContain("[Lounge]");
+  expect(lines[1]).toContain("[1:lounge]");
 });
 
 test("anonymous guest shows its assigned name and a live prompt (not read-only)", () => {
@@ -93,7 +93,7 @@ test("anonymous guest shows its assigned name and a live prompt (not read-only)"
   socket.deliver({ type: "identity", user: "brave-otter-7k", verified: false });
   const { lastFrame } = render(<App client={client} user={null} staticInput />);
   const frame = lastFrame() ?? "";
-  expect(frame).toContain("brave-otter-7k (guest"); // "(guest · /login to claim)"
-  expect(frame).toContain("/login to claim");
+  expect(frame).toContain("brave-otter-7k"); // its assigned guest name, on the notice row
+  expect(frame).toContain("[#rust]"); // a live lime input prompt (guests can chat)
   expect(frame).not.toContain("read-only");
 });
