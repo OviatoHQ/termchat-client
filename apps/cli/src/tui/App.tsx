@@ -171,11 +171,15 @@ function fmtMarket(m: ServerMarketplaceMessage): string {
     case "no_experts":
       return `no experts available under $${m.maxRate}/min${m.topic ? ` for ${m.topic}` : ""}`;
     case "summon_request":
-      return `⚡ ${m.from} needs help${m.topic ? ` (${m.topic})` : ""} @ $${m.rate}/min up to ${m.maxMinutes}min: "${m.problem}" — /accept`;
+      return m.free
+        ? `⚡ ${m.from} needs help${m.topic ? ` (${m.topic})` : ""} — FREE CALL (no payout) up to ${m.maxMinutes}min: "${m.problem}" — /accept`
+        : `⚡ ${m.from} needs help${m.topic ? ` (${m.topic})` : ""} @ $${m.rate}/min up to ${m.maxMinutes}min: "${m.problem}" — /accept`;
     case "summon_closed":
       return "an offer closed";
     case "session_start":
-      return `session #${m.sessionId} with ${m.peer} @ $${m.rate}/min (cap ${m.maxMinutes}min) — /end to finish`;
+      return m.free
+        ? `session #${m.sessionId} with ${m.peer} — FREE CALL (cap ${m.maxMinutes}min) — /end to finish`
+        : `session #${m.sessionId} with ${m.peer} @ $${m.rate}/min (cap ${m.maxMinutes}min) — /end to finish`;
     case "session_end":
       return `session #${m.sessionId} ended: ${m.minutes}min, ${m.role === "seeker" ? `you paid ${usd(m.chargeCents)}` : `you earned ${usd(m.payoutCents)}`}`;
     case "expert_list":
@@ -319,13 +323,19 @@ export function App({
       // the local in-call meter shown in both status bars, and records call.json so the
       // presence daemon can render the same meter in the Claude Code status line.
       if (m.type === "session_start") {
-        setCall({ sessionId: m.sessionId, peer: m.peer, rate: m.rate });
+        // A free/comped call bills $0 — show the meter, status line, and call page as
+        // $0.00 rather than accruing the expert's real per-minute rate (honest UX;
+        // the edge is still the billing authority and settles it at $0).
+        const meterRate = m.free ? 0 : m.rate;
+        setCall({ sessionId: m.sessionId, peer: m.peer, rate: meterRate });
         setCallSecs(0);
-        writeCallState({ peer: m.peer, rate: m.rate, startedAt: Date.now() });
+        writeCallState({ peer: m.peer, rate: meterRate, startedAt: Date.now() });
         if (session && token) {
-          openUrl(`${session.httpBase}/call#session=${m.sessionId}&token=${token}&rate=${m.rate}`);
+          openUrl(
+            `${session.httpBase}/call#session=${m.sessionId}&token=${token}&rate=${meterRate}`,
+          );
         } else {
-          onCall?.(m.sessionId, m.rate);
+          onCall?.(m.sessionId, meterRate);
         }
       }
       // Ending it stops the meter (the ended session lands in the Calls tab to rate).
@@ -441,8 +451,15 @@ export function App({
           problem: command.problem,
           maxRate: command.maxRate,
           ...(command.target ? { target: command.target } : {}),
+          ...(command.code ? { code: command.code } : {}),
         });
-        setNotice(command.target ? `Calling ${command.target}…` : "Looking for an expert…");
+        setNotice(
+          command.code
+            ? "Looking for an expert (free call)…"
+            : command.target
+              ? `Calling ${command.target}…`
+              : "Looking for an expert…",
+        );
         return;
       case "accept":
         if (!marketplace.accept(command.reqId)) setNotice("No pending offer to accept.");

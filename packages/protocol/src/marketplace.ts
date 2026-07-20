@@ -63,6 +63,11 @@ export const ClientMarketplaceMessage = z.discriminatedUnion("type", [
      *  instead of the open topic/rate auction. The rate cap still applies. Handle is a
      *  public username (matched case-insensitively on the edge) — no new PII. */
     target: z.string().trim().min(1).max(64).optional(),
+    /** Free-call promo code (`/call --code …`). An OPAQUE token — the edge does ALL
+     *  validation/consumption (this field is safe to publish to the open-source
+     *  client). A valid code bypasses the card-on-file gate and books a $0 comped
+     *  session (no Stripe hold/capture). Invalid/expired/exhausted → summon rejected. */
+    code: z.string().trim().min(1).max(64).optional(),
   }),
   z.object({ type: z.literal("accept"), reqId: z.string().min(1).max(64) }),
   z.object({ type: z.literal("decline"), reqId: z.string().min(1).max(64) }),
@@ -179,6 +184,9 @@ export const ServerMarketplaceMessage = z.discriminatedUnion("type", [
     problem: z.string(),
     rate: z.number(),
     maxMinutes: z.number().int(),
+    /** This is a FREE (promo-comped) call: accepting it pays the expert $0. The TUI
+     *  must surface this so the expert consents knowingly (never a silent $0). */
+    free: z.boolean().optional(),
   }),
   z.object({ type: z.literal("summon_closed"), reqId: z.string() }),
   z.object({
@@ -189,6 +197,9 @@ export const ServerMarketplaceMessage = z.discriminatedUnion("type", [
     rate: z.number(),
     maxMinutes: z.number().int(),
     problem: z.string(),
+    /** Free/comped call: both parties are billed $0. The client shows the in-call
+     *  meter + call page as FREE instead of accruing `rate × minutes`. */
+    free: z.boolean().optional(),
   }),
   z.object({
     type: z.literal("session_end"),

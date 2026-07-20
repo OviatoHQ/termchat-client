@@ -22,7 +22,7 @@ export type Command =
   | { kind: "onboard" }
   // marketplace
   | { kind: "expert"; on: boolean; rate?: number; topics: string[] }
-  | { kind: "summon"; maxRate: number; problem: string; target?: string }
+  | { kind: "summon"; maxRate: number; problem: string; target?: string; code?: string }
   | { kind: "accept"; reqId?: string }
   | { kind: "decline"; reqId?: string }
   | { kind: "end" }
@@ -163,11 +163,25 @@ export function parseCommand(input: string): Command | null {
       return parseExpert(rest);
     case "call":
     case "summon": {
-      // /call [@handle] <maxRate> <problem…>   (/summon is a legacy alias)
+      // /call [--code <CODE>] [@handle] <maxRate> <problem…>   (/summon is a legacy alias)
       // A leading @handle targets ONE named expert directly; without it, the call
       // is the open topic/rate auction. The @ sigil is required to disambiguate a
       // handle from a (malformed) rate. The rate cap applies in both forms.
+      // --code carries an OPAQUE free-call promo code; the edge validates it (an
+      // invalid code just gets rejected server-side — it grants nothing on its own).
       let parts = rest;
+      let code: string | undefined;
+      const codeIdx = parts.indexOf("--code");
+      if (codeIdx !== -1) {
+        code = parts[codeIdx + 1]?.trim();
+        if (!code) {
+          return {
+            kind: "invalid",
+            reason: "usage: /call --code <CODE> [@handle] <maxRate> <problem>",
+          };
+        }
+        parts = parts.filter((_, i) => i !== codeIdx && i !== codeIdx + 1);
+      }
       let target: string | undefined;
       if (parts[0]?.startsWith("@")) {
         target = parts[0].slice(1).trim();
@@ -181,12 +195,16 @@ export function parseCommand(input: string): Command | null {
       if (!Number.isFinite(maxRate) || !problem) {
         return {
           kind: "invalid",
-          reason: "usage: /call [@handle] <maxRate> <problem>",
+          reason: "usage: /call [--code <CODE>] [@handle] <maxRate> <problem>",
         };
       }
-      return target
-        ? { kind: "summon", maxRate, problem, target }
-        : { kind: "summon", maxRate, problem };
+      return {
+        kind: "summon",
+        maxRate,
+        problem,
+        ...(target ? { target } : {}),
+        ...(code ? { code } : {}),
+      };
     }
     case "accept":
       // Real-time call offer only. Bounty answers are approved with /approve.

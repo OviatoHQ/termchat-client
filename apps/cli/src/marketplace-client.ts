@@ -93,6 +93,8 @@ export class MarketplaceClient {
     maxMinutes?: number;
     /** Targeted summon: address one named expert by handle instead of the auction. */
     target?: string;
+    /** Free-call promo code (opaque; validated on the edge). */
+    code?: string;
   }): void {
     this.send({ type: "summon", ...input });
   }

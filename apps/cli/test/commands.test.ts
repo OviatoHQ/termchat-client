@@ -85,6 +85,27 @@ test("parses marketplace commands", () => {
     problem: "borrow checker help",
     target: "chef",
   });
+  // Free-call promo code: --code carries an opaque token (validated on the edge),
+  // stripped from the args before the @handle / rate / problem are parsed.
+  expect(parseCommand("/call --code FREE123 5 borrow checker help")).toEqual({
+    kind: "summon",
+    maxRate: 5,
+    problem: "borrow checker help",
+    code: "FREE123",
+  });
+  // --code composes with a targeted @handle, in any order.
+  expect(parseCommand("/call @chef --code FREE123 5 risotto")).toEqual({
+    kind: "summon",
+    maxRate: 5,
+    problem: "risotto",
+    target: "chef",
+    code: "FREE123",
+  });
+  // --code with no value is a usage error, not a silent no-op.
+  expect(parseCommand("/call --code")).toEqual({
+    kind: "invalid",
+    reason: "usage: /call --code <CODE> [@handle] <maxRate> <problem>",
+  });
   expect(parseCommand("/accept")).toEqual({ kind: "accept" });
   expect(parseCommand("/accept r1")).toEqual({ kind: "accept", reqId: "r1" });
   expect(parseCommand("/end")).toEqual({ kind: "end" });
