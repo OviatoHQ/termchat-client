@@ -13,7 +13,8 @@ const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
-const TAGLINE = "Your agent is running. You don't have to wait alone.";
+const TAGLINE =
+  "hangout with other humans while your agent is working, got stuck? jump on a call with an expert or become an expert";
 
 function useColor(): boolean {
   return process.stdout.isTTY === true && !process.env.NO_COLOR;

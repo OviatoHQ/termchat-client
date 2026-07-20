@@ -6,7 +6,7 @@ test("banner renders the square mark, the wordmark, and the tagline", () => {
   const banner = renderBanner();
   expect(banner).toContain("██"); // the two-square brand mark
   expect(banner).toContain("termchat");
-  expect(banner).toContain("You don't have to wait alone.");
+  expect(banner).toContain("jump on a call with an expert");
 });
 
 test("parseInstallArgs reads --edge, --yes, and the status-line flags", () => {
