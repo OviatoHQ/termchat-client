@@ -1,8 +1,35 @@
 import { expect, test } from "bun:test";
-import { parseCommand } from "../src/commands.ts";
+import { COMMAND_INFO, matchCommands, parseCommand } from "../src/commands.ts";
 
 test("plain text becomes a message", () => {
   expect(parseCommand("hello there")).toEqual({ kind: "message", text: "hello there" });
+});
+
+test("matchCommands: '/' lists every command", () => {
+  expect(matchCommands("/").length).toBe(COMMAND_INFO.length);
+});
+
+test("matchCommands: prefix filters by canonical name", () => {
+  expect(matchCommands("/ca").map((c) => c.name)).toEqual(["call", "card"]);
+  expect(matchCommands("/HE").map((c) => c.name)).toEqual(["help"]); // case-insensitive
+  // "expert" is a prefix of both — but the EXACT match floats to the top so Enter picks it.
+  expect(matchCommands("/expert").map((c) => c.name)).toEqual(["expert", "experts"]);
+  expect(matchCommands("/experts").map((c) => c.name)).toEqual(["experts"]);
+});
+
+test("matchCommands: not a bare command prefix → no menu", () => {
+  expect(matchCommands("")).toEqual([]); // empty
+  expect(matchCommands("hi")).toEqual([]); // no slash
+  expect(matchCommands("/call 4 fix")).toEqual([]); // has args (space)
+  expect(matchCommands("/zzz")).toEqual([]); // no match
+});
+
+test("every COMMAND_INFO name is parseable (metadata ↔ parser in sync)", () => {
+  for (const c of COMMAND_INFO) {
+    const parsed = parseCommand(`/${c.name}`);
+    // A bare command is never "unknown" (it may be "invalid" if it needs args).
+    expect(parsed?.kind).not.toBe("unknown");
+  }
 });
 
 test("blank input is null", () => {

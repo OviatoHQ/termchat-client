@@ -13,7 +13,7 @@ import { Box, Text, useApp, useInput } from "ink";
 import { useEffect, useMemo, useState } from "react";
 import { beginLogin, submitLoginCode } from "../auth.ts";
 import { billingLinkNotice, dashboardNotice } from "../billing.ts";
-import { type Command, parseCommand } from "../commands.ts";
+import { type Command, type CommandInfo, matchCommands, parseCommand } from "../commands.ts";
 import { clearCredentials, writeCredentials } from "../config.ts";
 import { type DmController, type DmControllerState, createDmController } from "../dm-controller.ts";
 import { writeCallState } from "../line.ts";
@@ -23,8 +23,9 @@ import { openUrl } from "../open-url.ts";
 import { PresenceNotifyClient } from "../presence-notify.ts";
 import { hitTest, regionsForView } from "./hit-test.ts";
 import type { MouseEvent } from "./mouse.ts";
-import { type TabId, reduceKey, windowStripCells } from "./nav.ts";
+import { type DmView, type TabId, reduceKey, windowStripCells } from "./nav.ts";
 import { C, G, cellWidth, nickColor } from "./theme.ts";
+import { ageShort, timeAgo } from "./timeago.ts";
 import { useMouse } from "./use-mouse.ts";
 
 const HELP_LINES = [
@@ -118,6 +119,23 @@ function useBlink(active: boolean): boolean {
     return () => clearInterval(id);
   }, [active]);
   return on;
+}
+
+/** A coarse (~30 s) wall-clock tick that drives the DM inbox's "2 mins ago" labels.
+ *  Held steady (no timer) when `active` is false — off the inbox and under `bun test`
+ *  (mirrors {@link useBlink}) — so nothing repaints idly. Refreshes `now` immediately
+ *  on becoming active so entering the inbox shows current times, not a stale mount value.
+ *  Flicker-safe: the App renders one row under the terminal height, so periodic
+ *  re-renders do smooth partial updates. */
+function useNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, [active]);
+  return now;
 }
 
 const usd = (cents: number): string => `$${(cents / 100).toFixed(2)}`;
@@ -217,6 +235,11 @@ export function App({
   // ---- tabbed navigation (docs/UI-EXPLORATION.md, steps 1–2) ----
   const [activeTab, setActiveTab] = useState<TabId>("lounge");
   const [selection, setSelection] = useState(0);
+  // Highlighted row in the `/` command autocomplete menu.
+  const [paletteSel, setPaletteSel] = useState(0);
+  // DMs "compose a new DM" mode: the inbox's "+ Send new DM" row switches the bottom
+  // bar to an "@username …" composer. Cleared when a thread opens or we leave the tab.
+  const [dmComposeNew, setDmComposeNew] = useState(false);
   const [experts, setExperts] = useState<ExpertCard[]>([]);
   const [bounties, setBounties] = useState<BountyCard[]>([]);
   const [sessions, setSessions] = useState<SessionCard[]>([]);
@@ -250,11 +273,12 @@ export function App({
     return dmController.subscribe((next) => setDmState({ ...next }));
   }, [dmController]);
 
-  // The open DM thread is "read" only while the DMs tab is on-screen. Off it, incoming
-  // messages accumulate as unread (the badge lights up); back on it, they mark read.
+  // The open DM thread is "read" only while it's actually on-screen — i.e. the DMs tab
+  // is active AND a thread is open (not the inbox). Off it, incoming messages accumulate
+  // as unread (the badge lights up); back on the thread, they mark read.
   useEffect(() => {
-    dmController?.setFocused(activeTab === "dms");
-  }, [dmController, activeTab]);
+    dmController?.setFocused(activeTab === "dms" && Boolean(dmState?.activePeer));
+  }, [dmController, activeTab, dmState?.activePeer]);
 
   // DM notifications are PUSH, not polled: hold a presence socket and refresh the inbox
   // only when the edge nudges us that a DM arrived (the same channel the daemon uses for
@@ -418,7 +442,7 @@ export function App({
           maxRate: command.maxRate,
           ...(command.target ? { target: command.target } : {}),
         });
-        setNotice(command.target ? `Summoning ${command.target}…` : "Looking for an expert…");
+        setNotice(command.target ? `Calling ${command.target}…` : "Looking for an expert…");
         return;
       case "accept":
         if (!marketplace.accept(command.reqId)) setNotice("No pending offer to accept.");
@@ -479,6 +503,7 @@ export function App({
     }
     setActiveTab("dms");
     setSelection(0);
+    setDmComposeNew(false);
     void dmController.openThread(peer).then(() => {
       if (message) dmController.sendMessage(message);
       // The thread + safety number now render in the pane; drop the transient notice
@@ -486,6 +511,36 @@ export function App({
       setNotice((n) => (n === `Opening DM with ${peer}…` ? "" : n));
     });
     setNotice(`Opening DM with ${peer}…`);
+  };
+
+  // "+ Send new DM" composer submit: parse `@handle [message…]` (a leading @ is optional),
+  // then open/create that thread — reusing openDm so it lands in the thread view with the
+  // [@handle] prompt. An empty handle just keeps the composer up with a hint.
+  const startNewDm = (line: string): void => {
+    const trimmed = line.trim().replace(/^@/, "");
+    const sp = trimmed.search(/\s/);
+    const handle = (sp === -1 ? trimmed : trimmed.slice(0, sp)).trim();
+    const message = sp === -1 ? "" : trimmed.slice(sp + 1).trim();
+    if (!handle) {
+      setNotice('Type "@username" (optionally followed by a message) to start a DM.');
+      return;
+    }
+    openDm(handle, message || undefined);
+  };
+
+  // "‹ see all DMs" / Esc: return to the inbox. From the composer, just cancel it; from a
+  // thread, close it (keeps the controller alive and reloads the inbox).
+  const dmBack = (): void => {
+    setDraft("");
+    if (dmComposeNew) {
+      setDmComposeNew(false);
+      setNotice("");
+      return;
+    }
+    if (dmState?.activePeer) {
+      dmController?.closeThread();
+      setSelection(0);
+    }
   };
 
   const submit = (line: string): void => {
@@ -522,6 +577,9 @@ export function App({
         // Anyone connected can post — anonymous guests included. Paid actions
         // (below, via handleMarket) still require a signed-in identity.
         client.sendMessage(command.text);
+        // Clear any lingering status (e.g. the multi-line /help block) once you send —
+        // otherwise it hangs around on screen after you've moved on to chatting.
+        setNotice("");
         break;
       case "dm":
         openDm(command.user, command.message);
@@ -589,7 +647,7 @@ export function App({
       }
       case "report": {
         if (!user) {
-          setNotice("Sign in to report.");
+          setNotice("Sign in with /login to report someone.");
           return;
         }
         if (!command.user) {
@@ -600,12 +658,23 @@ export function App({
         setNotice(`Reported ${command.user}.`);
         break;
       }
-      case "rooms":
-        setNotice(`Rooms: ${LOUNGE_ROOMS.join(", ")}`);
+      case "rooms": {
+        const others = LOUNGE_ROOMS.filter((r) => r !== state.room);
+        setNotice(
+          others.length
+            ? `You're in #${state.room} · switch with /join <room>: ${others.join(", ")}`
+            : `You're in #${state.room} — the only room right now.`,
+        );
         break;
+      }
       case "who": {
         const names = fmtMembers(state.members).join(", ") || "(nobody here yet)";
-        setNotice(`In #${state.room}: ${names}`);
+        const n = state.members.length;
+        setNotice(
+          n > 0
+            ? `#${state.room} · ${n} here: ${names} · /dm <name> to message`
+            : `#${state.room} · nobody here yet — say hi to break the ice.`,
+        );
         break;
       }
       case "help":
@@ -637,7 +706,24 @@ export function App({
   // Total unread DMs across threads — drives the DMs-tab highlight + a status-line
   // count (the in-app "you have DMs" cue that needs no presence daemon).
   const dmUnread = (dmState?.threads ?? []).reduce((n, t) => n + t.unread, 0);
+  // Which DMs sub-view is showing: an open thread wins; else the "new DM" composer if
+  // armed; else the inbox (DM-IMPROVEMENTS.md). Used for input/nav/hit-test routing.
+  const dmView: DmView = dmState?.activePeer ? "thread" : dmComposeNew ? "new" : "inbox";
+  const dmThreadCount = dmState?.threads.length ?? 0;
   const { rows, cols } = useTerminalSize();
+  // The inbox's relative-time labels tick while the inbox is on-screen (gated, so no
+  // idle repaint elsewhere / under tests).
+  const now = useNow(staticInput !== true && activeTab === "dms" && dmView === "inbox");
+
+  // `/` command autocomplete — only for the lounge command line (not a pending
+  // login/nick prompt, the summon-confirm, or a DM message). Open iff the draft is a bare
+  // command prefix that matches something; the menu captures ↑/↓/Tab/Enter/Esc.
+  const paletteMatches: readonly CommandInfo[] =
+    activeTab === "lounge" && !summonExpert && !pendingLogin && !pendingNick
+      ? matchCommands(draft)
+      : [];
+  const paletteOpen = paletteMatches.length > 0;
+  const palSel = paletteOpen ? Math.min(paletteSel, paletteMatches.length - 1) : 0;
 
   // ---- Me tab: account actions as a selectable, Enter-activatable list ----
   const meActions: { label: string; run: () => void }[] = user
@@ -687,7 +773,10 @@ export function App({
           : activeTab === "me"
             ? meActions.length
             : activeTab === "dms"
-              ? (dmState?.threads.length ?? 0)
+              ? // Inbox is a list of [+ Send new DM, ...threads]; thread/new have no list.
+                dmView === "inbox"
+                ? 1 + dmThreadCount
+                : 0
               : 0;
   const sel = itemCount > 0 ? Math.min(selection, itemCount - 1) : 0;
 
@@ -698,7 +787,12 @@ export function App({
     if (tab === "experts") marketplace?.experts(); // refresh the directory on entry
     if (tab === "bounties") marketplace?.bounties(); // refresh the board on entry
     if (tab === "calls") marketplace?.mySessions(); // refresh your sessions on entry
-    if (tab === "dms") void dmController?.refreshInbox(); // reload the thread list on entry
+    if (tab === "dms") {
+      // Land on the inbox ("show all my DMs"): close any open thread and cancel compose.
+      // closeThread() also reloads the inbox; if signed out there's nothing to close.
+      setDmComposeNew(false);
+      if (dmController) dmController.closeThread();
+    }
   };
 
   // Activate an item by (tab, index) so the keyboard (Enter on the highlight) and the
@@ -763,8 +857,23 @@ export function App({
     }
     if (tab === "me") meActions[index]?.run();
     if (tab === "dms") {
-      const thread = dmState?.threads[index];
-      if (thread) void dmController?.openThread(thread.peer);
+      if (!dmController || !user) {
+        setNotice("Sign in with /login to send direct messages.");
+        return;
+      }
+      // Inbox convention: index 0 = "+ Send new DM"; index ≥1 = threads[index-1].
+      if (index === 0) {
+        setDmComposeNew(true);
+        setDraft("");
+        setNotice('New DM — type "@username" then your message, Enter to send. Esc to cancel.');
+        return;
+      }
+      const thread = dmState?.threads[index - 1];
+      if (thread) {
+        setDmComposeNew(false);
+        setDraft("");
+        void dmController?.openThread(thread.peer);
+      }
     }
   };
 
@@ -774,7 +883,7 @@ export function App({
     const e = summonExpert;
     if (!e) return;
     if (!marketplace || !user) {
-      setNotice("Sign in with /login to summon an expert.");
+      setNotice("Sign in with /login to call an expert.");
       return;
     }
     const problem = draft.trim();
@@ -787,7 +896,7 @@ export function App({
     setDraft("");
     setActiveTab("lounge");
     setSelection(0);
-    setNotice(`Summoning ${e.user} @ ≤ $${e.rate}/min…`);
+    setNotice(`Calling ${e.user} @ ≤ $${e.rate}/min…`);
   };
 
   // Mouse (step 3): route a left-click through the same region map the layout draws,
@@ -801,6 +910,8 @@ export function App({
       activeTab,
       cols,
       dmUnread,
+      dmView,
+      dmThreadCount,
       expertsCount: experts.length,
       meCount: meActions.length,
       bountiesCount: bounties.length,
@@ -825,6 +936,12 @@ export function App({
     } else if (target.kind === "session") {
       setSelection(target.index);
       activate("calls", target.index);
+    } else if (target.kind === "dm-row") {
+      // Inbox row: index 0 = "+ Send new DM", ≥1 = open threads[index-1] (same as Enter).
+      setSelection(target.index);
+      activate("dms", target.index);
+    } else if (target.kind === "dm-back") {
+      dmBack();
     }
   };
   useMouse(staticInput !== true, handleMouse);
@@ -843,7 +960,7 @@ export function App({
       if (summonExpert) {
         if (key.escape) {
           setSummonExpert(null);
-          setNotice("Summon cancelled.");
+          setNotice("Call cancelled.");
           return;
         }
         if (key.return) {
@@ -858,7 +975,15 @@ export function App({
         return;
       }
       const action = reduceKey(
-        { activeTab, selection: sel, itemCount, draft, locked: pendingLogin !== null },
+        {
+          activeTab,
+          selection: sel,
+          itemCount,
+          draft,
+          locked: pendingLogin !== null,
+          dmView,
+          paletteOpen,
+        },
         input,
         key,
       );
@@ -869,14 +994,42 @@ export function App({
         case "move-selection":
           setSelection(action.selection);
           break;
+        case "palette-move": {
+          const n = paletteMatches.length;
+          if (n > 0) setPaletteSel((s) => (Math.min(s, n - 1) + action.delta + n) % n); // wrap
+          break;
+        }
+        case "palette-accept": {
+          const cmd = paletteMatches[palSel];
+          if (!cmd) break;
+          setPaletteSel(0);
+          if (cmd.args) {
+            setDraft(`/${cmd.name} `); // complete, wait for args (menu closes: has a space)
+          } else {
+            setDraft("");
+            submit(`/${cmd.name}`); // no args → run it now
+          }
+          break;
+        }
+        case "palette-close": // Esc cancels the command entry
+          setDraft("");
+          setPaletteSel(0);
+          break;
         case "submit":
           setDraft("");
-          // In the DMs pane the input is the conversation, not the lounge/command line.
-          if (activeTab === "dms") dmController?.sendMessage(action.line);
-          else submit(action.line);
+          // In the DMs pane the input is the conversation (thread) or the new-DM composer,
+          // not the lounge/command line.
+          if (activeTab === "dms") {
+            if (dmComposeNew) startNewDm(action.line);
+            else dmController?.sendMessage(action.line);
+          } else submit(action.line);
+          break;
+        case "back":
+          dmBack();
           break;
         case "edit-draft":
           setDraft(action.draft);
+          setPaletteSel(0); // typing re-filters the `/` menu → back to the top row
           break;
         case "activate":
           activate(activeTab, sel);
@@ -911,13 +1064,42 @@ export function App({
   // excluded here — the bottom input line serves the Lounge and open DM threads.
   const showInput =
     !summonExpert &&
-    (activeTab === "lounge" || (activeTab === "dms" && Boolean(dmState?.activePeer)));
+    (activeTab === "lounge" || (activeTab === "dms" && (dmView === "thread" || dmView === "new")));
   const inputContext = pendingLogin
     ? "code"
     : activeTab === "dms"
-      ? (dmState?.activeLabel ?? dmState?.activePeer ?? "dm")
+      ? dmView === "new"
+        ? "new dm"
+        : `@${dmState?.activeLabel ?? dmState?.activePeer ?? "dm"}`
       : `#${state.room}`;
   const loungeConnecting = activeTab === "lounge" && !who && !pendingLogin;
+
+  // The always-on footer hint for the list tabs (shown when the input line isn't).
+  // Make the verb match the tab — "call"/"claim"/"rate"/"run", not a generic "select" —
+  // and, when the body is really a sign-in wall, say so instead of promising an action
+  // the guest can't take yet. This line is on-screen constantly, so it's the highest-
+  // value place to be contextual (see the notices, which only flash once per action).
+  const tail = "· Tab switch window";
+  const navHint = ((): string => {
+    const gate = `Sign in on the Me tab (/login) to unlock this ${tail}`;
+    const listSignedIn = Boolean(marketplace && user);
+    switch (activeTab) {
+      case "experts":
+        return listSignedIn
+          ? `↑↓ move · Enter to call the expert (offline → post a bounty) ${tail}`
+          : gate;
+      case "bounties":
+        return listSignedIn ? `↑↓ move · Enter to claim · last row posts a bounty ${tail}` : gate;
+      case "calls":
+        return listSignedIn ? `↑↓ move · Enter to rate the selected call ${tail}` : gate;
+      case "me":
+        return `↑↓ move · Enter to run the selected action ${tail}`;
+      case "dms":
+        return dmController && user ? `↑↓ move · Enter to open · click a name to DM ${tail}` : gate;
+      default:
+        return `↑↓ move · Enter/click select ${tail}`;
+    }
+  })();
 
   // Olive status bars: Ink 5 has no Box background, so each bar is padded Text filling
   // the full row. Pad = cols − left − right, over-estimating the (emoji-bearing) right
@@ -930,19 +1112,29 @@ export function App({
   );
   const winCells = windowStripCells(activeTab, dmUnread);
   const winLeftW = winCells.reduce((n, c) => n + c.text.length, 0);
-  const winRight = call ? `${G.summon} ${meterClock} ` : "call: ~45s to a human ";
+  const winRight = call ? `${G.summon} ${meterClock} ` : "";
   const winPad = " ".repeat(Math.max(1, cols - winLeftW - cellWidth(winRight)));
 
   // Sidebar ~22% of width (clamped); chat gets the rest.
   const sidebarWidth = Math.min(26, Math.max(14, Math.floor(cols * 0.22)));
-  // Window the transcript to what fits: total rows minus header chrome (title +
+  // Render ONE row shorter than the terminal. When Ink's output height equals the
+  // terminal height, every repaint (cursor blink, keystroke, incoming message) does a
+  // full erase-and-redraw that scroll-jitters the bottom line — the whole screen
+  // "flickers". Leaving the last row empty keeps output < terminal height, so Ink does
+  // smooth partial updates instead. See the blink note on useBlink.
+  const contentRows = Math.max(1, rows - 1);
+  // Window the transcript to what fits: content rows minus header chrome (title +
   // tab strip) + footer chrome (status, notice, input) and the optional mkt log.
   const mktRows = mktLog.length > 0 ? mktLog.length + 1 : 0;
-  const visible = Math.max(3, rows - 2 /* header */ - 3 /* footer */ - mktRows);
+  const visible = Math.max(3, contentRows - 2 /* header */ - 3 /* footer */ - mktRows);
   const shown = state.lines.slice(-visible);
+  // The DM thread view has taller header chrome than the lounge (back row + query
+  // header + up to 2 safety-number rows), so window its messages a little tighter to
+  // keep the bottom input line on-screen for long conversations.
+  const dmVisible = Math.max(3, visible - 3);
 
   return (
-    <Box flexDirection="column" width={cols} height={rows}>
+    <Box flexDirection="column" width={cols} height={contentRows}>
       {/* ── top olive bar: ▄▀ brand mark + presence, or the in-call meter + [end] ── */}
       <Box>
         <Text backgroundColor={C.barBg}> </Text>
@@ -984,20 +1176,21 @@ export function App({
         )}
       </Box>
 
-      {/* ── olive window bar: numbered irssi windows (click / Tab) + summon hint ── */}
+      {/* ── window bar: numbered irssi windows (click / Tab). Darker than the presence
+             bar above so the two rows read as separate lines. In-call meter on the right. ── */}
       <Box>
         {winCells.map((cell) => (
           <Text
             key={cell.tab}
-            backgroundColor={C.barBg}
+            backgroundColor={C.barBg2}
             color={cell.active ? C.barFg : cell.unread ? C.accent : "#b9b58c"}
             bold={cell.active || cell.unread}
           >
             {cell.text}
           </Text>
         ))}
-        <Text backgroundColor={C.barBg}>{winPad}</Text>
-        <Text backgroundColor={C.barBg} color={call ? C.amber : C.fgBright}>
+        <Text backgroundColor={C.barBg2}>{winPad}</Text>
+        <Text backgroundColor={C.barBg2} color={call ? C.amber : C.fgBright}>
           {winRight}
         </Text>
       </Box>
@@ -1041,8 +1234,6 @@ export function App({
               })
             )}
             <Box flexGrow={1} />
-            <Text color={C.muted2}> {G.online} verified</Text>
-            <Text color={C.muted2}> {G.offline} guest</Text>
           </Box>
         </Box>
       )}
@@ -1053,7 +1244,12 @@ export function App({
           <ExpertsBody experts={experts} sel={sel} signedIn={Boolean(marketplace && user)} />
         ))}
       {activeTab === "bounties" && (
-        <BountiesBody bounties={bounties} sel={sel} signedIn={Boolean(marketplace && user)} />
+        <BountiesBody
+          bounties={bounties}
+          sel={sel}
+          signedIn={Boolean(marketplace && user)}
+          now={now}
+        />
       )}
       {activeTab === "calls" && (
         <CallsBody
@@ -1069,7 +1265,9 @@ export function App({
           dm={dmState}
           sel={sel}
           signedIn={Boolean(dmController && user)}
-          sidebarWidth={sidebarWidth}
+          dmView={dmView}
+          now={now}
+          maxLines={dmVisible}
         />
       )}
 
@@ -1094,6 +1292,9 @@ export function App({
         </Text>
       </Text>
 
+      {/* `/` command menu (Claude-Code style): filtered list above the input, ↑↓ + Tab/Enter */}
+      <CommandPalette matches={paletteMatches} sel={palSel} />
+
       {/* input line: lime context prompt + draft + blinking block cursor, or nav hint */}
       {summonExpert ? (
         <Text color={C.muted2}> Enter authorize the hold · Esc cancel</Text>
@@ -1104,11 +1305,40 @@ export function App({
           <Text color={C.fg}>{cursorOn ? "█" : " "}</Text>
         </Box>
       ) : (
-        <Text color={C.muted2}>
-          {activeTab === "dms"
-            ? "↑↓ pick a thread · Enter open · type to reply · Tab switch window"
-            : "↑↓ move · Enter/click select · Tab switch window"}
-        </Text>
+        <Text color={C.muted2}>{navHint}</Text>
+      )}
+    </Box>
+  );
+}
+
+/** The `/` command autocomplete menu (Claude-Code style): a filtered, windowed list of
+ *  commands above the input. `matches` is the filtered set, `sel` the highlighted index.
+ *  Renders nothing when there are no matches (menu closed). */
+export function CommandPalette({
+  matches,
+  sel,
+}: {
+  matches: readonly CommandInfo[];
+  sel: number;
+}): React.ReactElement | null {
+  if (matches.length === 0) return null;
+  const MAX = 8;
+  // Keep the selected row in view when the list is long (a bare "/" lists everything).
+  const start = matches.length > MAX ? Math.min(Math.max(0, sel - 3), matches.length - MAX) : 0;
+  const shown = matches.slice(start, start + MAX);
+  return (
+    <Box flexDirection="column">
+      {shown.map((c) => {
+        const on = c === matches[sel];
+        return (
+          <Text key={c.name} {...(on ? { backgroundColor: C.rowHighlight } : {})}>
+            <Text color={C.accent} bold={on}>{` ${`/${c.name}`.padEnd(12)} `}</Text>
+            <Text color={C.muted2}>{c.desc}</Text>
+          </Text>
+        );
+      })}
+      {matches.length > shown.length && (
+        <Text color={C.muted2}>{`  … ${matches.length - shown.length} more · ↑↓ Tab`}</Text>
       )}
     </Box>
   );
@@ -1182,7 +1412,7 @@ export function SummonConfirmBody({
   const topics = expert.topics.join(" ") || "any";
   return (
     <Box flexDirection="column" flexGrow={1}>
-      <Text color={C.amber}>{` SUMMON ${expert.user.toUpperCase()} — CONFIRM THE HOLD`}</Text>
+      <Text color={C.amber}>{` CALL ${expert.user.toUpperCase()} — CONFIRM THE HOLD`}</Text>
       <Text> </Text>
       <Text>
         <Text color={C.muted2}>{" expert     "}</Text>
@@ -1235,10 +1465,12 @@ export function BountiesBody({
   bounties,
   sel,
   signedIn,
+  now,
 }: {
   bounties: BountyCard[];
   sel: number;
   signedIn: boolean;
+  now: number;
 }): React.ReactElement {
   if (!signedIn) {
     return (
@@ -1255,7 +1487,7 @@ export function BountiesBody({
       {bounties.map((b, i) => {
         const active = i === sel;
         const topic = b.topic ?? "any";
-        const q = b.question.length > 48 ? `${b.question.slice(0, 47)}…` : b.question;
+        const q = b.question.length > 44 ? `${b.question.slice(0, 43)}…` : b.question;
         return (
           <Text key={b.bountyId} {...(active ? { backgroundColor: C.rowHighlight } : {})}>
             <Text color={C.accent}>{active ? "›" : " "}</Text>
@@ -1263,6 +1495,7 @@ export function BountiesBody({
             <Text color={C.amber}>{`  ${usd(b.priceCents)}`}</Text>
             <Text color={C.muted}>{`  ${topic}`}</Text>
             <Text color={C.fg2}>{`  "${q}"`}</Text>
+            <Text color={C.muted2}>{`  open ${ageShort(b.createdAt, now)}`}</Text>
             <Text color={C.accent}>{"  [claim]"}</Text>
           </Text>
         );
@@ -1389,18 +1622,27 @@ export function MeBody({
   );
 }
 
-/** The DMs tab: thread list (left) + the open conversation with its verification
- *  header (right). Two-pane, mirroring the Lounge layout (docs/DMS.md stage 3b). */
+/** The DMs tab. Three screens (DM-IMPROVEMENTS.md), NOT a split pane:
+ *  - inbox:  "+ Send new DM" then the conversations (most-recent first, unread dot,
+ *            @name, relative time). Inbox rows are index 0 = new DM, ≥1 = threads[index-1]
+ *            (the convention hit-test.ts + activate() + reduceKey share).
+ *  - thread: "‹ see all DMs" back action, the verification header, and the conversation.
+ *  - new:    a hint for the "@username …" composer that lives on the bottom input line. */
 export function DmsBody({
   dm,
   sel,
   signedIn,
-  sidebarWidth,
+  dmView,
+  now,
+  maxLines = 200,
 }: {
   dm: DmControllerState | null;
   sel: number;
   signedIn: boolean;
-  sidebarWidth: number;
+  dmView: DmView;
+  now: number;
+  /** Window the open thread's messages to the last N so the input line stays on-screen. */
+  maxLines?: number;
 }): React.ReactElement {
   if (!signedIn) {
     return (
@@ -1409,82 +1651,98 @@ export function DmsBody({
       </Box>
     );
   }
-  const threads = dm?.threads ?? [];
-  const active = dm?.active ?? null;
-  // Render a message's sender by their DISPLAY name: "me" for my own lines, the peer's
-  // current display name for theirs (both keyed off the stable handles).
-  const senderLabel = (from: string): string => {
-    if (active?.self && from === active.self) return "me";
-    if (from === dm?.activePeer) return dm?.activeLabel ?? from;
-    return from;
-  };
-  const isMine = (from: string): boolean => Boolean(active?.self && from === active.self);
 
-  return (
-    <Box flexGrow={1}>
-      {/* conversation pane */}
-      <Box flexDirection="column" flexGrow={1} marginRight={1}>
-        {dm?.activePeer ? (
-          <>
-            <Text>
-              <Text color={C.muted2}>{" -!- query with "}</Text>
-              <Text {...nickProps(dm.activeLabel ?? dm.activePeer, false)}>
-                {dm.activeLabel ?? dm.activePeer}
+  if (dmView === "new") {
+    return (
+      <Box flexDirection="column" flexGrow={1}>
+        <Text>
+          <Text color={C.accent}>{" + "}</Text>
+          <Text color={C.fgBright} bold>
+            New message
+          </Text>
+        </Text>
+        <Text color={C.muted2}>
+          {
+            ' Type "@username" below (optionally followed by a message), Enter to send. Esc to cancel.'
+          }
+        </Text>
+      </Box>
+    );
+  }
+
+  if (dmView === "thread") {
+    const active = dm?.active ?? null;
+    const name = dm?.activeLabel ?? dm?.activePeer ?? "dm";
+    // Render a message's sender by their DISPLAY name: "me" for my own lines, the peer's
+    // current display name for theirs (both keyed off the stable handles).
+    const senderLabel = (from: string): string => {
+      if (active?.self && from === active.self) return "me";
+      if (from === dm?.activePeer) return dm?.activeLabel ?? from;
+      return from;
+    };
+    const isMine = (from: string): boolean => Boolean(active?.self && from === active.self);
+    return (
+      <Box flexDirection="column" flexGrow={1}>
+        {/* back action — FIRST body row (hit-test dm-back pins to BODY_TOP) */}
+        <Text>
+          <Text color={C.accent}>{" ‹ "}</Text>
+          <Text color={C.muted}>see all DMs</Text>
+        </Text>
+        <Text>
+          <Text color={C.muted2}>{" -!- query with "}</Text>
+          <Text {...nickProps(name, false)}>{`@${name}`}</Text>
+          <Text color={C.accent}>{` ${G.verified}`}</Text>
+        </Text>
+        <DmHeader keyStatus={dm?.keyStatus ?? null} safetyWords={dm?.safetyWords ?? []} />
+        {dm?.error ? (
+          <Text color={C.danger}>{` ${dm.error}`}</Text>
+        ) : (active?.lines.length ?? 0) === 0 ? (
+          <Text color={C.muted2}> No messages yet. Type below to say hi.</Text>
+        ) : (
+          (active?.lines ?? []).slice(-maxLines).map((l) => (
+            <Text key={l.id} {...(l.pending ? { dimColor: true } : {})}>
+              <Text color={C.muted}>{" <"}</Text>
+              <Text {...nickProps(senderLabel(l.from), isMine(l.from))}>{senderLabel(l.from)}</Text>
+              <Text color={C.muted}>{"> "}</Text>
+              <Text color={C.fg}>
+                {l.undecryptable ? "[can't decrypt]" : `${l.text}${l.pending ? " …" : ""}`}
               </Text>
-              <Text color={C.accent}>{` ${G.verified}`}</Text>
             </Text>
-            <DmHeader keyStatus={dm.keyStatus} safetyWords={dm.safetyWords} />
-            {dm.error ? (
-              <Text color={C.danger}>{` ${dm.error}`}</Text>
-            ) : (active?.lines.length ?? 0) === 0 ? (
-              <Text color={C.muted2}> No messages yet. Type below to say hi.</Text>
-            ) : (
-              active?.lines.map((l) => (
-                <Text key={l.id} {...(l.pending ? { dimColor: true } : {})}>
-                  <Text color={C.muted}>{" <"}</Text>
-                  <Text {...nickProps(senderLabel(l.from), isMine(l.from))}>
-                    {senderLabel(l.from)}
-                  </Text>
-                  <Text color={C.muted}>{"> "}</Text>
-                  <Text color={C.fg}>
-                    {l.undecryptable ? "[can't decrypt]" : `${l.text}${l.pending ? " …" : ""}`}
-                  </Text>
-                </Text>
-              ))
-            )}
-          </>
-        ) : (
-          <Text color={C.muted2}> Select a thread (↑↓, Enter) or use /dm &lt;user&gt;.</Text>
+          ))
         )}
       </Box>
-      {/* thread list */}
-      <Box
-        flexDirection="column"
-        width={sidebarWidth}
-        borderStyle="single"
-        borderColor={C.line}
-        borderTop={false}
-        borderRight={false}
-        borderBottom={false}
-      >
-        <Text color={C.muted}> QUERIES</Text>
-        {threads.length === 0 ? (
-          <Text color={C.muted2}> — none — /dm user</Text>
-        ) : (
-          threads.map((t, i) => {
-            const isActive = i === sel;
-            return (
-              <Text key={t.peer}>
-                <Text color={C.accent}>{isActive ? "›" : " "}</Text>
-                <Text {...nickProps(t.displayName ?? t.peer, isActive)}>
-                  {t.displayName ?? t.peer}
-                </Text>
-                {t.unread > 0 && <Text color={C.accent} bold>{` ${G.online}${t.unread}`}</Text>}
+    );
+  }
+
+  // inbox — "+ Send new DM" is row 0 (index 0); threads follow (row i → index i).
+  const threads = dm?.threads ?? [];
+  return (
+    <Box flexDirection="column" flexGrow={1}>
+      <Text {...(sel === 0 ? { backgroundColor: C.rowHighlight } : {})}>
+        <Text color={C.accent}>{sel === 0 ? "›" : " "}</Text>
+        <Text color={sel === 0 ? C.fgBright : C.accent} bold={sel === 0}>
+          {" + Send new DM"}
+        </Text>
+      </Text>
+      {threads.length === 0 ? (
+        <Text color={C.muted2}> No conversations yet — start one above.</Text>
+      ) : (
+        threads.map((t, i) => {
+          const on = sel === i + 1;
+          const name = t.displayName ?? t.peer;
+          return (
+            <Text key={t.peer} {...(on ? { backgroundColor: C.rowHighlight } : {})}>
+              <Text color={C.accent}>{on ? "›" : " "}</Text>
+              {/* unread marker: lime ● when unread, else a matching-width blank */}
+              <Text color={t.unread > 0 ? C.accent : C.muted2}>
+                {t.unread > 0 ? ` ${G.online}` : "  "}
               </Text>
-            );
-          })
-        )}
-      </Box>
+              <Text {...nickProps(name, on)}>{` @${name}`}</Text>
+              <Text color={C.muted2}>{`  ${timeAgo(t.lastTs, now)}`}</Text>
+            </Text>
+          );
+        })
+      )}
     </Box>
   );
 }

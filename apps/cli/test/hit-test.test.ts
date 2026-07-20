@@ -3,6 +3,7 @@ import {
   BODY_TOP,
   BOUNTIES_LIST_OFFSET,
   CALLS_LIST_OFFSET,
+  DMS_INBOX_OFFSET,
   TAB_ROW,
   bodyRegions,
   hitTest,
@@ -15,6 +16,8 @@ const view = (over: Partial<Parameters<typeof bodyRegions>[0]>) => ({
   activeTab: "lounge" as const,
   cols: 80,
   dmUnread: 0,
+  dmView: "inbox" as const,
+  dmThreadCount: 0,
   expertsCount: 0,
   meCount: 0,
   bountiesCount: 0,
@@ -119,6 +122,37 @@ test("Me body: one row per action, below header/subheader/spacer", () => {
   expect(regions).toHaveLength(2);
   expect(hitTest(regions, 5, BODY_TOP + 3)).toEqual({ kind: "me-action", index: 0 });
   expect(hitTest(regions, 5, BODY_TOP + 4)).toEqual({ kind: "me-action", index: 1 });
+});
+
+test("DMs inbox: '+ Send new DM' is row 0, threads follow (index i → threads[i-1])", () => {
+  const regions = bodyRegions(view({ activeTab: "dms", dmView: "inbox", dmThreadCount: 2 }));
+  expect(regions).toHaveLength(3); // 1 "Send new DM" + 2 threads
+  expect(hitTest(regions, 5, BODY_TOP + DMS_INBOX_OFFSET)).toEqual({ kind: "dm-row", index: 0 });
+  expect(hitTest(regions, 5, BODY_TOP + DMS_INBOX_OFFSET + 1)).toEqual({
+    kind: "dm-row",
+    index: 1,
+  });
+  expect(hitTest(regions, 5, BODY_TOP + DMS_INBOX_OFFSET + 2)).toEqual({
+    kind: "dm-row",
+    index: 2,
+  });
+  expect(hitTest(regions, 5, BODY_TOP + DMS_INBOX_OFFSET + 3)).toBeUndefined();
+});
+
+test("DMs inbox with no threads still has the '+ Send new DM' row", () => {
+  const regions = bodyRegions(view({ activeTab: "dms", dmView: "inbox", dmThreadCount: 0 }));
+  expect(regions).toHaveLength(1);
+  expect(hitTest(regions, 5, BODY_TOP + DMS_INBOX_OFFSET)).toEqual({ kind: "dm-row", index: 0 });
+});
+
+test("DMs thread: the '‹ see all DMs' back action is the only body target", () => {
+  const regions = bodyRegions(view({ activeTab: "dms", dmView: "thread", dmThreadCount: 5 }));
+  expect(regions).toHaveLength(1);
+  expect(hitTest(regions, 5, BODY_TOP)).toEqual({ kind: "dm-back" });
+});
+
+test("DMs new-DM composer has no body click targets (Esc cancels)", () => {
+  expect(bodyRegions(view({ activeTab: "dms", dmView: "new", dmThreadCount: 3 }))).toHaveLength(0);
 });
 
 test("Lounge and Calls have no body click targets (only the tab strip)", () => {

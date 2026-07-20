@@ -44,8 +44,11 @@ export const C = {
   amber: "#d9a94e",
   /** end-call, destructive */
   danger: "#cf6b62",
-  /** irssi status bar background (TUI top + bottom bars) */
+  /** irssi status bar background (TUI top presence bar) */
   barBg: "#4d5233",
+  /** darker bar background for the tab/window strip, so it reads as a separate line
+   *  from the presence bar above it */
+  barBg2: "#3a3e26",
   /** irssi status bar foreground */
   barFg: "#eae6c3",
   /** inverse background for the [end] chip in the status bar */

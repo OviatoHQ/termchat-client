@@ -3,6 +3,7 @@ import { render } from "ink-testing-library";
 import type { DmControllerState } from "../src/dm-controller.ts";
 import { DmsBody } from "../src/tui/App.tsx";
 
+const NOW = 1_000_000_000;
 const base: DmControllerState = {
   threads: [],
   activePeer: null,
@@ -14,38 +15,80 @@ const base: DmControllerState = {
 };
 
 test("guests are prompted to sign in (DMs are login-only)", () => {
-  const { lastFrame } = render(<DmsBody dm={base} sel={0} signedIn={false} sidebarWidth={20} />);
+  const { lastFrame } = render(
+    <DmsBody dm={base} sel={0} signedIn={false} dmView="inbox" now={NOW} />,
+  );
   expect(lastFrame() ?? "").toContain("Sign in with /login");
 });
 
-test("renders the thread list with unread badges", () => {
+test("inbox: '+ Send new DM' is the FIRST body row (pins DMS_INBOX_OFFSET = 0)", () => {
+  const dm: DmControllerState = {
+    ...base,
+    threads: [{ peer: "bob", lastId: 9, lastTs: NOW - 120_000, unread: 2 }],
+  };
+  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn dmView="inbox" now={NOW} />);
+  const firstLine = (lastFrame() ?? "").split("\n")[0] ?? "";
+  expect(firstLine).toContain("Send new DM");
+});
+
+test("inbox: shows @names, relative time, and a lime unread dot; most-recent order preserved", () => {
   const dm: DmControllerState = {
     ...base,
     threads: [
-      { peer: "bob", lastId: 9, lastTs: 100, unread: 2 },
-      { peer: "carol", lastId: 4, lastTs: 90, unread: 0 },
+      { peer: "chef-handle", displayName: "chef", lastId: 9, lastTs: NOW - 120_000, unread: 2 },
+      { peer: "mira", lastId: 4, lastTs: NOW - 180_000, unread: 0 },
     ],
   };
-  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn sidebarWidth={20} />);
+  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn dmView="inbox" now={NOW} />);
   const frame = lastFrame() ?? "";
-  expect(frame).toContain("bob");
-  expect(frame).toContain("●2"); // unread badge
-  expect(frame).toContain("carol");
-  expect(frame).toContain("Select a thread"); // no thread open yet
+  expect(frame).toContain("+ Send new DM");
+  expect(frame).toContain("@chef"); // display name, prefixed
+  expect(frame).toContain("@mira");
+  expect(frame).toContain("2 mins ago");
+  expect(frame).toContain("3 mins ago");
+  expect(frame).toContain("●"); // the unread marker (chef has unread)
+  expect(frame).not.toContain("chef-handle"); // raw handle never surfaced
 });
 
-test("an open thread shows the conversation and the safety-number header", () => {
+test("inbox: selection caret sits on '+ Send new DM' at sel 0, on the first thread at sel 1", () => {
   const dm: DmControllerState = {
     ...base,
-    threads: [{ peer: "bob", lastId: 1, lastTs: 1, unread: 0 }],
+    threads: [{ peer: "bob", lastId: 9, lastTs: NOW - 60_000, unread: 0 }],
+  };
+  const sel0 =
+    render(<DmsBody dm={dm} sel={0} signedIn dmView="inbox" now={NOW} />).lastFrame() ?? "";
+  const sel1 =
+    render(<DmsBody dm={dm} sel={1} signedIn dmView="inbox" now={NOW} />).lastFrame() ?? "";
+  // At sel 0 the caret leads the "Send new DM" line; at sel 1 it leads the "@bob" line.
+  expect(sel0.split("\n").find((l) => l.includes("Send new DM"))).toContain("›");
+  expect(sel1.split("\n").find((l) => l.includes("@bob"))).toContain("›");
+});
+
+test("inbox: empty state keeps the '+ Send new DM' action", () => {
+  const { lastFrame } = render(<DmsBody dm={base} sel={0} signedIn dmView="inbox" now={NOW} />);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("+ Send new DM");
+  expect(frame).toContain("No conversations yet");
+});
+
+test("new-DM composer shows the '@username …' helper", () => {
+  const { lastFrame } = render(<DmsBody dm={base} sel={0} signedIn dmView="new" now={NOW} />);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("New message");
+  expect(frame).toContain("@username");
+});
+
+test("thread: '‹ see all DMs' is the first row, then the header + conversation", () => {
+  const dm: DmControllerState = {
+    ...base,
     activePeer: "bob",
+    activeLabel: "bob",
     active: {
       peer: "bob",
       connected: true,
       self: "alice",
       lines: [{ id: 1, from: "bob", text: "yo bro ssup", ts: 1 }],
     },
-    // A full 16-word (128-bit) safety number — the header must show ALL of them.
     safetyWords: [
       "anchor",
       "ribbon",
@@ -66,35 +109,66 @@ test("an open thread shows the conversation and the safety-number header", () =>
     ],
     keyStatus: "new",
   };
-  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn sidebarWidth={20} />);
+  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn dmView="thread" now={NOW} />);
   const frame = lastFrame() ?? "";
-  expect(frame).toContain("query with bob");
+  expect(frame.split("\n")[0] ?? "").toContain("see all DMs"); // back action first
+  expect(frame).toContain("query with @bob");
   expect(frame).toContain("yo bro ssup");
   expect(frame).toContain("verify all 16 words");
-  expect(frame).toContain("anchor"); // first word
+  expect(frame).toContain("anchor"); // first safety word
   expect(frame).toContain("marble"); // …and the last — no truncation
 });
 
-test("a changed key raises a loud warning", () => {
-  const dm: DmControllerState = { ...base, activePeer: "bob", keyStatus: "changed" };
-  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn sidebarWidth={20} />);
+test("thread: a long conversation is windowed to the last maxLines (input stays on-screen)", () => {
+  const lines = Array.from({ length: 20 }, (_, i) => ({
+    id: i + 1,
+    from: "bob",
+    text: `msg-${i + 1}`,
+    ts: i + 1,
+  }));
+  const dm: DmControllerState = {
+    ...base,
+    activePeer: "bob",
+    activeLabel: "bob",
+    active: { peer: "bob", connected: true, self: "alice", lines },
+    safetyWords: [],
+    keyStatus: "pinned",
+  };
+  const { lastFrame } = render(
+    <DmsBody dm={dm} sel={0} signedIn dmView="thread" now={NOW} maxLines={5} />,
+  );
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("msg-20"); // newest shown
+  expect(frame).toContain("msg-16"); // last 5 → msg-16..20
+  expect(frame).not.toContain("msg-15"); // older ones windowed out
+  expect(frame).not.toContain("msg-1 "); // (trailing space guards against msg-1x match)
+});
+
+test("thread: a changed key raises a loud warning", () => {
+  const dm: DmControllerState = {
+    ...base,
+    activePeer: "bob",
+    activeLabel: "bob",
+    keyStatus: "changed",
+  };
+  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn dmView="thread" now={NOW} />);
   expect(lastFrame() ?? "").toContain("safety number changed");
 });
 
-test("opening a peer with no key shows the friendly error", () => {
+test("thread: a peer with no key shows the friendly error", () => {
   const dm: DmControllerState = {
     ...base,
     activePeer: "ghost",
-    error: "ghost hasn't set up DMs yet.",
+    activeLabel: "ghost",
+    error: "@ghost hasn't published a DM key on this server yet.",
   };
-  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn sidebarWidth={20} />);
-  expect(lastFrame() ?? "").toContain("hasn't set up DMs");
+  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn dmView="thread" now={NOW} />);
+  expect(lastFrame() ?? "").toContain("hasn't published a DM key");
 });
 
-test("shows display names (nick) as labels while keying by the stable handle", () => {
+test("thread: display names label messages; the raw handle is never surfaced", () => {
   const dm: DmControllerState = {
     ...base,
-    threads: [{ peer: "shafiu", displayName: "chef", lastId: 3, lastTs: 5, unread: 1 }],
     activePeer: "shafiu",
     activeLabel: "chef",
     active: {
@@ -109,9 +183,9 @@ test("shows display names (nick) as labels while keying by the stable handle", (
     safetyWords: [],
     keyStatus: "pinned",
   };
-  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn sidebarWidth={20} />);
+  const { lastFrame } = render(<DmsBody dm={dm} sel={0} signedIn dmView="thread" now={NOW} />);
   const frame = lastFrame() ?? "";
-  expect(frame).toContain("query with chef"); // header uses the display name
+  expect(frame).toContain("query with @chef"); // header uses the display name
   expect(frame).toContain("<chef> hey there"); // peer message labelled by display name
   expect(frame).toContain("<me> yo"); // my own message stays "me"
   expect(frame).not.toContain("shafiu"); // the raw handle is never surfaced

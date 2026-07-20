@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeAdapter } from "../src/claude-adapter.ts";
 import { install, uninstall } from "../src/installer.ts";
 
 type HookGroup = { hooks: Array<{ command: string }> };
@@ -215,4 +216,33 @@ test("uninstall removes our own status line", () => {
   install({ statusline: true });
   uninstall();
   expect(readSettings().statusLine).toBeUndefined();
+});
+
+test("removeStatus pulls our status line but leaves the presence hooks in place", () => {
+  install({ statusline: true });
+  const result = claudeAdapter.removeStatus();
+  expect(result.removed).toBe(true);
+
+  const settings = readSettings();
+  expect(settings.statusLine).toBeUndefined();
+  const stillWired = Object.values(hookMap(settings))
+    .flat()
+    .some((group) => (group.hooks[0]?.command ?? "").includes("TERMCHAT_HOOK=1"));
+  expect(stillWired).toBe(true);
+});
+
+test("removeStatus is a no-op when no termchat status line is present", () => {
+  install(); // hooks only, no status line
+  const result = claudeAdapter.removeStatus();
+  expect(result.removed).toBe(false);
+  expect(result.backupPath).toBeNull();
+});
+
+test("removeStatus restores the foreign status line it wrapped (never destroys it)", () => {
+  seedSettings({ statusLine: { type: "command", command: "my-statusline" } });
+  install({ statusline: true }); // wraps the foreign line so presence appends to it
+  const result = claudeAdapter.removeStatus();
+  expect(result.removed).toBe(true);
+  // The user's own status line is put back, not deleted.
+  expect((readSettings().statusLine as { command?: string }).command).toBe("my-statusline");
 });

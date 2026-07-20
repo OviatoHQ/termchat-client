@@ -93,6 +93,35 @@ describe("DmController", () => {
     expect(ctl.getState().threads).toEqual(threads);
   });
 
+  test("refreshInbox sorts threads most-recent (lastTs) first", async () => {
+    const threads: DmInboxThread[] = [
+      { peer: "old", lastId: 1, lastTs: 100, unread: 0 },
+      { peer: "newest", lastId: 3, lastTs: 300, unread: 1 },
+      { peer: "mid", lastId: 2, lastTs: 200, unread: 0 },
+    ];
+    const ctl = makeController({ inbox: threads });
+    await ctl.refreshInbox();
+    expect(ctl.getState().threads.map((t) => t.peer)).toEqual(["newest", "mid", "old"]);
+  });
+
+  test("closeThread clears the open thread but keeps the controller alive", async () => {
+    const ctl = makeController({
+      key: peer.publicKey,
+      inbox: [{ peer: "closepeer", lastId: 5, lastTs: 100, unread: 0 }],
+    });
+    await ctl.refreshInbox(); // inbox loaded (survives the close)
+    await ctl.openThread("closepeer");
+    expect(ctl.getState().activePeer).toBe("closepeer");
+    ctl.closeThread();
+    const s = ctl.getState();
+    expect(s.activePeer).toBeNull();
+    expect(s.active).toBeNull();
+    expect(s.safetyWords).toEqual([]);
+    expect(s.keyStatus).toBeNull();
+    // Controller still holds the inbox (not torn down like close()).
+    expect(s.threads.map((t) => t.peer)).toEqual(["closepeer"]);
+  });
+
   test("openThread pins a new key, computes the safety number, and connects", async () => {
     const ctl = makeController({ key: peer.publicKey });
     await ctl.openThread("bob");
@@ -123,7 +152,7 @@ describe("DmController", () => {
     const ctl = makeController({ key: null });
     await ctl.openThread("ghost");
     const s = ctl.getState();
-    expect(s.error).toContain("hasn't set up DMs");
+    expect(s.error).toContain("hasn't published a DM key");
     expect(s.active).toBeNull();
   });
 

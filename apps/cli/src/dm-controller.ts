@@ -88,10 +88,13 @@ export class DmController {
     };
   }
 
-  /** Reload the inbox (thread list + unread counts). Failures keep the last list. */
+  /** Reload the inbox (thread list + unread counts). Failures keep the last list.
+   *  Sorted most-recent-first client-side (the server already does, but the inbox UI
+   *  depends on the order so we don't rely on it). */
   async refreshInbox(): Promise<void> {
     try {
-      this.patch({ threads: await this.options.fetchInbox() });
+      const threads = [...(await this.options.fetchInbox())].sort((a, b) => b.lastTs - a.lastTs);
+      this.patch({ threads });
     } catch {
       // keep the last-known inbox; the tab still works from cache
     }
@@ -116,7 +119,10 @@ export class DmController {
         active: null,
         safetyWords: [],
         keyStatus: null,
-        error: `${typed} hasn't set up DMs yet.`,
+        // A 404 means no published key for `typed` ON THIS EDGE. That can be a guest
+        // (no account), or a signed-in user who hasn't opened termchat against this
+        // server — the client can't tell them apart, so say what's actually true.
+        error: `@${typed} hasn't published a DM key on this server yet.`,
       });
       return;
     }
@@ -188,6 +194,23 @@ export class DmController {
     if (maxId <= this.lastMarkedId) return;
     this.lastMarkedId = maxId;
     this.activeClient?.markRead(maxId);
+    void this.refreshInbox();
+  }
+
+  /** Close the open thread and return to the inbox WITHOUT killing the controller:
+   *  tears down the live client, clears the active-thread state, and refreshes the
+   *  inbox so unread counts re-derive. (`close()` kills the whole controller.) */
+  closeThread(): void {
+    this.teardownActive();
+    this.lastMarkedId = 0;
+    this.patch({
+      activePeer: null,
+      activeLabel: null,
+      active: null,
+      safetyWords: [],
+      keyStatus: null,
+      error: null,
+    });
     void this.refreshInbox();
   }
 

@@ -5,6 +5,7 @@ import type {
   AgentAdapter,
   InstallOptions,
   InstallResult,
+  RemoveStatusResult,
   UninstallResult,
 } from "./agent-adapter.ts";
 import { writeConfiguredEdge } from "./config.ts";
@@ -88,5 +89,32 @@ export const codexAdapter: AgentAdapter = {
     // The launcher is shared with the Claude adapter — the CLI removes it once, after
     // all detected agents are uninstalled, so a co-installed Claude never breaks.
     return { agent: "codex", settingsPath: path, backupPath };
+  },
+
+  // `termchat codex removestatus` — Codex has no command-backed status line to pull,
+  // so "stop showing termchat here" means removing our hooks from hooks.json. The
+  // shared launcher is intentionally left in place (a co-installed Claude may use it).
+  removeStatus(): RemoveStatusResult {
+    const path = hooksPath();
+    if (!existsSync(path)) {
+      return {
+        agent: "codex",
+        settingsPath: path,
+        backupPath: null,
+        removed: false,
+        message: "No Codex hooks file found — nothing to remove.",
+      };
+    }
+    const config = readJsonConfig(path);
+    const backupPath = backupFile(path);
+    stripOurHooks(config);
+    writeJsonConfig(path, config);
+    return {
+      agent: "codex",
+      settingsPath: path,
+      backupPath,
+      removed: true,
+      message: "Removed termchat's hooks from Codex (Codex has no command-backed status line).",
+    };
   },
 };

@@ -79,18 +79,68 @@ test("Empty-list tab: Down stays at 0", () => {
   });
 });
 
-test("DMs is a hybrid pane: arrows move threads, typing edits the draft", () => {
-  const dms = { ...base, activeTab: "dms" as const, itemCount: 3, selection: 1 };
-  expect(reduceKey(dms, "", { downArrow: true })).toEqual({ type: "move-selection", selection: 2 });
-  expect(reduceKey(dms, "", { upArrow: true })).toEqual({ type: "move-selection", selection: 0 });
-  expect(reduceKey(dms, "h", {})).toEqual({ type: "edit-draft", draft: "h" });
+// DMs inbox: a selectable list, index 0 = "+ Send new DM", index ≥1 = threads[index-1].
+// itemCount = 1 + threads.length (here: 1 + 2 threads = 3). No composer on the inbox.
+test("DMs inbox: arrows move the selection; typing is ignored; Enter activates", () => {
+  const inbox = {
+    ...base,
+    activeTab: "dms" as const,
+    dmView: "inbox" as const,
+    itemCount: 3,
+    selection: 1,
+  };
+  expect(reduceKey(inbox, "", { downArrow: true })).toEqual({
+    type: "move-selection",
+    selection: 2,
+  });
+  expect(reduceKey(inbox, "", { upArrow: true })).toEqual({ type: "move-selection", selection: 0 });
+  expect(reduceKey(inbox, "h", {})).toEqual({ type: "none" }); // no draft on the inbox
+  expect(reduceKey(inbox, "", { return: true })).toEqual({ type: "activate" });
 });
 
-test("DMs Enter: opens the highlighted thread when empty, else sends the draft", () => {
-  const dms = { ...base, activeTab: "dms" as const, itemCount: 3, selection: 1 };
-  expect(reduceKey(dms, "", { return: true })).toEqual({ type: "activate" });
-  expect(reduceKey({ ...dms, draft: "hey" }, "", { return: true })).toEqual({
+test("DMs inbox selection clamps at both ends", () => {
+  const inbox = { ...base, activeTab: "dms" as const, dmView: "inbox" as const, itemCount: 3 };
+  expect(reduceKey({ ...inbox, selection: 0 }, "", { upArrow: true })).toEqual({
+    type: "move-selection",
+    selection: 0,
+  });
+  expect(reduceKey({ ...inbox, selection: 2 }, "", { downArrow: true })).toEqual({
+    type: "move-selection",
+    selection: 2,
+  });
+});
+
+test("DMs thread: typing edits the reply; Enter sends non-empty; empty Enter no-ops; Esc goes back", () => {
+  const thread = { ...base, activeTab: "dms" as const, dmView: "thread" as const, itemCount: 0 };
+  expect(reduceKey(thread, "h", {})).toEqual({ type: "edit-draft", draft: "h" });
+  expect(reduceKey({ ...thread, draft: "hey" }, "", { return: true })).toEqual({
     type: "submit",
     line: "hey",
   });
+  expect(reduceKey(thread, "", { return: true })).toEqual({ type: "none" }); // don't send empty
+  expect(reduceKey(thread, "", { escape: true })).toEqual({ type: "back" });
+});
+
+test("command palette: open menu captures arrows/Tab/Enter/Esc; typing re-filters", () => {
+  const pal = { ...base, activeTab: "lounge" as const, draft: "/ca", paletteOpen: true };
+  expect(reduceKey(pal, "", { downArrow: true })).toEqual({ type: "palette-move", delta: 1 });
+  expect(reduceKey(pal, "", { upArrow: true })).toEqual({ type: "palette-move", delta: -1 });
+  expect(reduceKey(pal, "", { tab: true })).toEqual({ type: "palette-accept" }); // Tab accepts, not switch-tab
+  expect(reduceKey(pal, "", { return: true })).toEqual({ type: "palette-accept" });
+  expect(reduceKey(pal, "", { escape: true })).toEqual({ type: "palette-close" });
+  expect(reduceKey(pal, "l", {})).toEqual({ type: "edit-draft", draft: "/cal" }); // keeps filtering
+  expect(reduceKey(pal, "", { backspace: true })).toEqual({ type: "edit-draft", draft: "/c" });
+});
+
+test("DMs new-DM composer: typing edits; Enter submits the handle line; Esc goes back", () => {
+  const compose = {
+    ...base,
+    activeTab: "dms" as const,
+    dmView: "new" as const,
+    itemCount: 0,
+    draft: "@chef",
+  };
+  expect(reduceKey(compose, "x", {})).toEqual({ type: "edit-draft", draft: "@chefx" });
+  expect(reduceKey(compose, "", { return: true })).toEqual({ type: "submit", line: "@chef" });
+  expect(reduceKey(compose, "", { escape: true })).toEqual({ type: "back" });
 });

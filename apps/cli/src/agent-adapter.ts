@@ -41,6 +41,17 @@ export interface UninstallResult {
   backupPath: string | null;
 }
 
+export interface RemoveStatusResult {
+  agent: string;
+  /** The agent config file we touched (or would have). */
+  settingsPath: string;
+  backupPath: string | null;
+  /** Did we actually remove anything (false when nothing of ours was present)? */
+  removed: boolean;
+  /** Human-readable summary for the CLI to print. */
+  message: string;
+}
+
 export interface AgentAdapter {
   /** Stable agent id, used in reporting + `detect` selection. */
   readonly name: string;
@@ -53,4 +64,9 @@ export interface AgentAdapter {
   install(options?: InstallOptions): InstallResult;
   /** Remove ONLY termchat's entries from the agent's config. */
   uninstall(): UninstallResult;
+  /** Stop showing termchat in this agent. For an agent with a command-backed status
+   *  line (Claude) this removes just the status line and keeps the hooks; for an agent
+   *  without one (Codex) it removes termchat's hooks. Idempotent — `removed:false`
+   *  when nothing of ours was present. */
+  removeStatus(): RemoveStatusResult;
 }

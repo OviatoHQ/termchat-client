@@ -38,7 +38,14 @@ cd "$SRC"
 # 3. Install deps and wire the agent hooks + status line, pointed at prod.
 log "Installing dependencies…"
 bun install
-log "Wiring Claude Code hooks + status line (edge: $EDGE)…"
-bun apps/cli/src/cli.ts install --statusline --edge "$EDGE"
+# Wire hooks into every detected agent. When a real terminal is available we reattach
+# stdin to /dev/tty so the TS installer can ask, one agent at a time, before adding a
+# status line; a piped install with no TTY falls back to a non-interactive `--yes`.
+log "Wiring agent hooks (you'll be asked about the status line)…"
+if [ -r /dev/tty ]; then
+  bun apps/cli/src/cli.ts install --edge "$EDGE" < /dev/tty
+else
+  bun apps/cli/src/cli.ts install --yes --edge "$EDGE"
+fi
 
 log "Done — open a Claude Code session and the status line shows who's online."

@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import { OnlineResponse } from "@termchat/protocol";
-import { installDetected, uninstallDetected } from "./adapters.ts";
-import type { InstallOptions } from "./agent-adapter.ts";
+import { removeStatusFor, uninstallDetected } from "./adapters.ts";
 import { login, logout, whoami } from "./auth.ts";
 import { openBillingLink, openDashboard } from "./billing.ts";
 import { runChat } from "./chat.tsx";
@@ -9,12 +8,14 @@ import { resolveEdge } from "./config.ts";
 import { runDaemon } from "./daemon.ts";
 import { runDm } from "./dm.ts";
 import { runHook } from "./hooks.ts";
+import { runInstall } from "./install-cli.ts";
 import { renderLine } from "./line.ts";
 
 const USAGE = `termchat — terminal presence for the AI era
 
 usage:
-  termchat chat [room]                             open the lounge chat TUI
+  termchat                                         open the lounge chat TUI (default)
+  termchat chat [room]                             open the lounge chat TUI in a room
   termchat dm setup                                publish your DM identity key
   termchat dm fingerprint <user>                   show the safety number with a user
   termchat login                                   link this terminal via GitHub
@@ -23,8 +24,10 @@ usage:
   termchat dashboard                               open your web dashboard (browser)
   termchat card                                    save a payment card (browser)
   termchat onboard                                 set up expert payouts (browser)
-  termchat install [--statusline] [--edge <url>]   wire detected agents (Claude Code, Codex)
+  termchat install [--yes] [--edge <url>]          wire detected agents (asks to add the status line)
   termchat uninstall                               remove termchat's entries
+  termchat claude removestatus                     remove the termchat status line from Claude Code
+  termchat codex removestatus                      remove termchat's hooks from Codex
   termchat daemon                                  run the presence daemon
   termchat hook <event>                            one-shot hook (used by the coding agent)
   termchat online                                  print the current presence line
@@ -34,6 +37,8 @@ async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
 
   switch (command) {
+    // Bare `termchat` (no subcommand) opens the lounge chat — the primary thing.
+    case undefined:
     case "chat":
       await runChat(rest[0]);
       return;
@@ -64,25 +69,15 @@ async function main(): Promise<void> {
     case "hook":
       await runHook(rest[0]);
       return;
-    case "install": {
+    case "install":
       // Wire every detected agent (Claude + Codex); Claude by default if none found.
-      const results = installDetected(parseInstallArgs(rest));
-      for (const result of results) {
-        console.log(`termchat wired into ${result.agent} (${result.settingsPath})`);
-        console.log(`  launcher: ${result.launcherPath}`);
-        if (result.backupPath) console.log(`  backup:   ${result.backupPath}`);
-        if (result.statuslineInstalled)
-          console.log(
-            result.statuslineAppended
-              ? "  status line: presence appended to your existing one"
-              : "  status line installed",
-          );
-        if (result.statuslineSkippedReason)
-          console.log(`  status line: ${result.statuslineSkippedReason}`);
-        if (result.followUp) console.log(`  ⚠ ${result.followUp}`);
-      }
+      // Prompts, one agent at a time, before adding a status line (see install-cli.ts).
+      await runInstall(rest);
       return;
-    }
+    case "claude":
+    case "codex":
+      runAgentStatus(command, rest);
+      return;
     case "uninstall": {
       const results = uninstallDetected();
       for (const result of results) {
@@ -94,26 +89,32 @@ async function main(): Promise<void> {
     case "online":
       await printOnline();
       return;
-    default:
+    case "help":
+    case "--help":
+    case "-h":
       process.stdout.write(USAGE);
+      return;
+    default:
+      // Unknown subcommand — show usage (and flag it so a typo isn't silent).
+      process.stderr.write(`termchat: unknown command '${command}'\n\n`);
+      process.stdout.write(USAGE);
+      process.exitCode = 1;
   }
 }
 
-function parseInstallArgs(args: string[]): InstallOptions {
-  const options: InstallOptions = {};
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (arg === "--statusline") {
-      options.statusline = true;
-    } else if (arg === "--edge") {
-      const value = args[i + 1];
-      if (value) {
-        options.edge = value;
-        i += 1;
-      }
-    }
+/** `termchat claude|codex removestatus` — stop showing termchat in one agent. */
+function runAgentStatus(agent: "claude" | "codex", rest: string[]): void {
+  if (rest[0] !== "removestatus") {
+    process.stderr.write(`usage: termchat ${agent} removestatus\n`);
+    process.exitCode = 1;
+    return;
   }
-  return options;
+  const result = removeStatusFor(agent);
+  console.log(result.message);
+  if (result.removed) {
+    console.log(`  ${result.settingsPath}`);
+    if (result.backupPath) console.log(`  backup: ${result.backupPath}`);
+  }
 }
 
 async function printOnline(): Promise<void> {

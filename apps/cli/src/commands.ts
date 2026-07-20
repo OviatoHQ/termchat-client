@@ -38,6 +38,71 @@ export type Command =
   | { kind: "invalid"; reason: string }
   | { kind: "unknown"; name: string };
 
+/** One row in the slash-command autocomplete menu (the `/`-triggered palette). */
+export interface CommandInfo {
+  /** Canonical name, without the leading slash (also what the palette filters on). */
+  name: string;
+  /** One-line description shown to the right of the name. */
+  desc: string;
+  /** True when the command takes arguments — the palette completes to `/name ` and
+   *  waits; false runs it immediately on accept (e.g. /help, /quit). */
+  args: boolean;
+}
+
+/**
+ * The slash commands offered by the `/` autocomplete menu, in display order. Grouped
+ * loosely (chat · you · need help · give help) but kept a flat list so the palette can
+ * filter it by prefix. Aliases are intentionally omitted — a prefix like `/j` already
+ * matches `join`. Descriptions mirror /help; keep them in sync with parseCommand below.
+ */
+export const COMMAND_INFO: readonly CommandInfo[] = [
+  // chat
+  { name: "call", desc: "Call a paid expert for a live session", args: true },
+  { name: "dm", desc: "Open a direct message with someone", args: true },
+  { name: "join", desc: "Switch to another lounge room", args: true },
+  { name: "topic", desc: "Set the room's topic tag", args: true },
+  { name: "rooms", desc: "List the available rooms", args: false },
+  { name: "who", desc: "List who's in the current room", args: false },
+  { name: "nick", desc: "Change your display name", args: true },
+  { name: "report", desc: "Report a user to moderators", args: true },
+  { name: "help", desc: "Show all commands", args: false },
+  { name: "quit", desc: "Close termchat and exit", args: false },
+  // you / account
+  { name: "login", desc: "Sign in with GitHub", args: false },
+  { name: "logout", desc: "Sign out, back to guest", args: false },
+  { name: "whoami", desc: "Show who you're signed in as", args: false },
+  { name: "dashboard", desc: "Open your web dashboard", args: false },
+  { name: "card", desc: "Add or manage your payment card", args: false },
+  { name: "onboard", desc: "Set up expert payouts", args: false },
+  // need help (seeker)
+  { name: "bounty", desc: "Post an async paid question", args: true },
+  { name: "experts", desc: "List experts online now", args: false },
+  { name: "approve", desc: "Approve an answered bounty (pays out)", args: true },
+  { name: "reject", desc: "Reject an answered bounty", args: true },
+  { name: "review", desc: "Rate a finished call (1–5)", args: true },
+  { name: "dispute", desc: "Dispute a charge for a session", args: true },
+  // give help (expert)
+  { name: "expert", desc: "Go online/offline as a paid expert", args: true },
+  { name: "accept", desc: "Accept an incoming call offer", args: false },
+  { name: "decline", desc: "Decline an incoming call offer", args: false },
+  { name: "end", desc: "End the active call", args: false },
+  { name: "claim", desc: "Claim an open bounty to answer", args: true },
+  { name: "answer", desc: "Answer a bounty you claimed", args: true },
+  { name: "earnings", desc: "Show your earnings summary", args: false },
+];
+
+/** Commands whose canonical name starts with the text typed after `/` (case-insensitive).
+ *  `partial` is the raw draft INCLUDING the leading slash, e.g. "/ca". Returns [] when the
+ *  draft isn't a bare command prefix (empty, no slash, or already has a space/args). */
+export function matchCommands(partial: string): readonly CommandInfo[] {
+  if (!partial.startsWith("/") || /\s/.test(partial)) return [];
+  const q = partial.slice(1).toLowerCase();
+  const hits = COMMAND_INFO.filter((c) => c.name.startsWith(q));
+  // Float an EXACT name-match to the top so Enter picks what was typed, not a longer
+  // command it's a prefix of (e.g. "/expert" → expert, not experts). Otherwise keep order.
+  return hits.slice().sort((a, b) => (a.name === q ? -1 : 0) - (b.name === q ? -1 : 0));
+}
+
 export function parseCommand(input: string): Command | null {
   const trimmed = input.trim();
   if (!trimmed) return null;

@@ -5,6 +5,7 @@ import type {
   AgentAdapter,
   InstallOptions,
   InstallResult,
+  RemoveStatusResult,
   UninstallResult,
 } from "./agent-adapter.ts";
 import {
@@ -208,5 +209,43 @@ export const claudeAdapter: AgentAdapter = {
     removeIfExists(statuslineScriptPath());
     removeIfExists(wrappedStatuslinePath());
     return { agent: "claude", settingsPath: path, backupPath };
+  },
+
+  // `termchat claude removestatus` — pull just the status line; leave the presence
+  // hooks in place so termchat keeps working, only without the ambient bar line.
+  removeStatus(): RemoveStatusResult {
+    const path = settingsPath();
+    const settings = readJsonConfig(path);
+    if (!isOurStatusLine(settings.statusLine)) {
+      return {
+        agent: "claude",
+        settingsPath: path,
+        backupPath: null,
+        removed: false,
+        message: "No termchat status line found in Claude Code — nothing to remove.",
+      };
+    }
+    const backupPath = backupFile(path);
+    // If our status line WRAPPED a pre-existing (foreign) one, restore that original
+    // rather than deleting outright — same as uninstall(), so `removestatus` never
+    // destroys a status line the user had before termchat. Otherwise drop it entirely.
+    const original = readWrappedOriginal();
+    if (original) {
+      settings.statusLine = original;
+    } else {
+      delete settings.statusLine;
+    }
+    writeJsonConfig(path, settings);
+    removeIfExists(statuslineScriptPath());
+    removeIfExists(wrappedStatuslinePath());
+    return {
+      agent: "claude",
+      settingsPath: path,
+      backupPath,
+      removed: true,
+      message: original
+        ? "Removed the termchat status line and restored your previous one (presence hooks kept)."
+        : "Removed the termchat status line from Claude Code (presence hooks kept).",
+    };
   },
 };

@@ -44,12 +44,12 @@ async function fingerprint(user: string | undefined): Promise<void> {
   }
   const identity = loadOrCreateIdentity();
   // Ensure my own key is published first — otherwise I could read a safety number for
-  // `user` while they still see "hasn't set up DMs" for me (an asymmetric footgun).
-  // Publish is an idempotent upsert, so this is safe to repeat.
+  // `user` while they can't reach me (an asymmetric footgun). Publish is an idempotent
+  // upsert, so this is safe to repeat.
   await publishPublicKey(identity.publicKey);
   const their = await fetchPublicKey(user);
   if (!their) {
-    console.log(`${user} hasn't set up DMs yet (no published key).`);
+    console.log(`${user} hasn't published a DM key on this server yet.`);
     process.exitCode = 1;
     return;
   }

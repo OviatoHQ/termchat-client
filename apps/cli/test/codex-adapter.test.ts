@@ -126,3 +126,21 @@ test("detect() is true only when ~/.codex exists", () => {
   mkdirSync(codexHome, { recursive: true });
   expect(codexAdapter.detect()).toBe(true);
 });
+
+test("removeStatus strips our hooks (Codex has no status line) but keeps the user's", () => {
+  seed({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "echo mine" }] }] } });
+  codexAdapter.install();
+  const result = codexAdapter.removeStatus();
+  expect(result.removed).toBe(true);
+
+  const config = readConfig();
+  const all = Object.values(config.hooks ?? {}).flat();
+  expect(all.some((g) => (g.hooks[0]?.command ?? "").includes("TERMCHAT_HOOK=1"))).toBe(false);
+  expect(commandsFor(config, "UserPromptSubmit")).toEqual(["echo mine"]);
+});
+
+test("removeStatus is a no-op when no hooks.json exists", () => {
+  const result = codexAdapter.removeStatus();
+  expect(result.removed).toBe(false);
+  expect(result.backupPath).toBeNull();
+});

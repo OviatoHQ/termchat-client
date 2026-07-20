@@ -52,9 +52,14 @@ export interface KeyLike {
   return?: boolean;
   backspace?: boolean;
   delete?: boolean;
+  escape?: boolean;
   ctrl?: boolean;
   meta?: boolean;
 }
+
+/** DMs sub-view (see DM-IMPROVEMENTS.md): the inbox list, an open thread, or the
+ *  "new DM" composer. Drives which keys the DMs pane accepts. */
+export type DmView = "inbox" | "thread" | "new";
 
 export interface NavState {
   activeTab: TabId;
@@ -67,6 +72,12 @@ export interface NavState {
   /** True while a login code is pending — freezes tab switching so the input can
    *  capture the pasted code without a stray Tab stealing focus. */
   locked: boolean;
+  /** Which DMs sub-view is showing (only meaningful when activeTab === "dms").
+   *  Defaults to "inbox" when unset. */
+  dmView?: DmView;
+  /** True when the `/` command autocomplete menu is open (lounge, draft is a bare
+   *  command prefix). While open it captures ↑/↓/Tab/Enter/Esc for the menu. */
+  paletteOpen?: boolean;
 }
 
 export type NavAction =
@@ -75,6 +86,11 @@ export type NavAction =
   | { type: "activate" }
   | { type: "submit"; line: string }
   | { type: "edit-draft"; draft: string }
+  | { type: "back" }
+  // command-palette actions (the App owns the filtered list + selection index)
+  | { type: "palette-move"; delta: number }
+  | { type: "palette-accept" }
+  | { type: "palette-close" }
   | { type: "none" };
 
 function cycle(current: TabId, dir: 1 | -1): TabId {
@@ -97,6 +113,19 @@ function cycle(current: TabId, dir: 1 | -1): TabId {
  *    Lounge draft).
  */
 export function reduceKey(state: NavState, input: string, key: KeyLike): NavAction {
+  // The `/` command menu (lounge) captures navigation keys while it's open. Typing and
+  // backspace still edit the draft — that re-filters the menu (and closes it once the
+  // draft stops being a bare command prefix, e.g. after a space).
+  if (state.paletteOpen) {
+    if (key.upArrow) return { type: "palette-move", delta: -1 };
+    if (key.downArrow) return { type: "palette-move", delta: 1 };
+    if (key.tab || key.return) return { type: "palette-accept" };
+    if (key.escape) return { type: "palette-close" };
+    if (key.backspace || key.delete) return { type: "edit-draft", draft: state.draft.slice(0, -1) };
+    if (input && !key.ctrl && !key.meta) return { type: "edit-draft", draft: state.draft + input };
+    return { type: "none" };
+  }
+
   if (key.tab) {
     if (state.locked) return { type: "none" };
     return { type: "switch-tab", tab: cycle(state.activeTab, key.shift ? -1 : 1) };
@@ -109,17 +138,31 @@ export function reduceKey(state: NavState, input: string, key: KeyLike): NavActi
     return { type: "none" };
   }
 
-  // DMs is a HYBRID pane: ↑/↓ move the thread-list highlight; typing edits the
-  // conversation draft. Enter sends the draft when there's one, else opens the
-  // highlighted thread (so an empty Enter on a thread row opens it).
+  // DMs has three sub-views (DM-IMPROVEMENTS.md):
+  //  - inbox:  a selectable list [+ Send new DM, ...threads] — no composer. ↑/↓ move,
+  //            Enter activates (index 0 = new DM, index ≥1 = open threads[index-1]).
+  //            Typing is ignored so keystrokes never leak into a draft.
+  //  - thread: the open conversation's composer. Typing edits the draft; Enter sends a
+  //            non-empty draft; Esc goes back to the inbox.
+  //  - new:    the "@username …" composer. Typing edits; Enter submits (App parses the
+  //            handle + optional message); Esc goes back.
   if (state.activeTab === "dms") {
-    if (key.upArrow) return { type: "move-selection", selection: Math.max(0, state.selection - 1) };
-    if (key.downArrow) {
-      const max = Math.max(0, state.itemCount - 1);
-      return { type: "move-selection", selection: Math.min(max, state.selection + 1) };
+    const view = state.dmView ?? "inbox";
+    if (view === "inbox") {
+      if (key.upArrow)
+        return { type: "move-selection", selection: Math.max(0, state.selection - 1) };
+      if (key.downArrow) {
+        const max = Math.max(0, state.itemCount - 1);
+        return { type: "move-selection", selection: Math.min(max, state.selection + 1) };
+      }
+      if (key.return) return { type: "activate" };
+      return { type: "none" };
     }
+    // thread | new — a composer is focused.
+    if (key.escape) return { type: "back" };
     if (key.return) {
-      return state.draft.trim() ? { type: "submit", line: state.draft } : { type: "activate" };
+      if (view === "new") return { type: "submit", line: state.draft };
+      return state.draft.trim() ? { type: "submit", line: state.draft } : { type: "none" };
     }
     if (key.backspace || key.delete) return { type: "edit-draft", draft: state.draft.slice(0, -1) };
     if (input && !key.ctrl && !key.meta) return { type: "edit-draft", draft: state.draft + input };

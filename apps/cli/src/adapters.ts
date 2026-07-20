@@ -2,6 +2,7 @@ import type {
   AgentAdapter,
   InstallOptions,
   InstallResult,
+  RemoveStatusResult,
   UninstallResult,
 } from "./agent-adapter.ts";
 import { claudeAdapter } from "./claude-adapter.ts";
@@ -32,4 +33,11 @@ export function uninstallDetected(): UninstallResult[] {
   // has been uninstalled, so a co-installed agent is never left with a dead launcher.
   removeIfExists(launcherPath());
   return results;
+}
+
+/** Back the `termchat <agent> removestatus` commands — target one named adapter. */
+export function removeStatusFor(name: string): RemoveStatusResult {
+  const adapter = ALL_ADAPTERS.find((a) => a.name === name);
+  if (!adapter) throw new Error(`unknown agent: ${name}`);
+  return adapter.removeStatus();
 }

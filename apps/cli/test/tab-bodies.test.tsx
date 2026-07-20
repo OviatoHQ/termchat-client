@@ -60,7 +60,7 @@ test("layout: first Me action sits at ME_LIST_OFFSET below the body top", () => 
   expect(lines[ME_LIST_OFFSET]).toContain("zzmarker-action");
 });
 
-test("ExpertsBody: online expert renders dot, topics, rate, rating, and a Summon CTA", () => {
+test("ExpertsBody: online expert renders dot, topics, rate, rating, and a Call CTA", () => {
   const { lastFrame } = render(<ExpertsBody experts={[card({})]} sel={0} signedIn />);
   const frame = lastFrame() ?? "";
   expect(frame).toContain("●"); // online dot
@@ -103,7 +103,7 @@ test("SummonConfirmBody: spells out the hold (rate × 30-min cap) + the typed pr
         cursorOn={true}
       />,
     ).lastFrame() ?? "";
-  expect(frame).toContain("SUMMON DANA"); // confirm header
+  expect(frame).toContain("CALL DANA"); // confirm header
   expect(frame).toContain("$2/min"); // the rate (amber)
   expect(frame).toContain("$60.00 max"); // hold = rate × 30-min cap
   expect(frame).toContain("borrow checker fight"); // the problem input echoes the draft
@@ -125,29 +125,36 @@ test("ExpertsBody: empty list shows a quiet placeholder", () => {
 
 test("layout: first bounty row sits at BOUNTIES_LIST_OFFSET below the body top", () => {
   const lines = (
-    render(<BountiesBody bounties={[bounty({ bountyId: 77 })]} sel={0} signedIn />).lastFrame() ??
-    ""
+    render(
+      <BountiesBody bounties={[bounty({ bountyId: 77 })]} sel={0} signedIn now={0} />,
+    ).lastFrame() ?? ""
   ).split("\n");
   expect(lines[0]).toContain("BOUNTIES"); // header on line 0
   expect(lines[BOUNTIES_LIST_OFFSET]).toContain("#77");
 });
 
-test("BountiesBody: open bounty shows id, price, topic, question, and a Claim CTA", () => {
-  const frame = render(<BountiesBody bounties={[bounty({})]} sel={0} signedIn />).lastFrame() ?? "";
+test("BountiesBody: open bounty shows id, price, topic, question, age, and a Claim CTA", () => {
+  // createdAt 0, now = 2h → "open 2h" (the age column from the mock).
+  const frame =
+    render(
+      <BountiesBody bounties={[bounty({})]} sel={0} signedIn now={2 * 3_600_000} />,
+    ).lastFrame() ?? "";
   expect(frame).toContain("#14");
   expect(frame).toContain("$3.00");
   expect(frame).toContain("rust");
   expect(frame).toContain("borrow checker");
+  expect(frame).toContain("open 2h"); // relative age since posting
   expect(frame).toContain("[claim]");
   expect(frame).toContain("[post a bounty]"); // the post action always follows
 });
 
 test("BountiesBody: empty board still offers Post; signed-out shows a prompt", () => {
-  const empty = render(<BountiesBody bounties={[]} sel={0} signedIn />).lastFrame() ?? "";
+  const empty = render(<BountiesBody bounties={[]} sel={0} signedIn now={0} />).lastFrame() ?? "";
   expect(empty).toContain("No open bounties");
   expect(empty).toContain("[post a bounty]");
   const guest =
-    render(<BountiesBody bounties={[bounty({})]} sel={0} signedIn={false} />).lastFrame() ?? "";
+    render(<BountiesBody bounties={[bounty({})]} sel={0} signedIn={false} now={0} />).lastFrame() ??
+    "";
   expect(guest).toContain("Sign in");
   expect(guest).not.toContain("[claim]");
 });

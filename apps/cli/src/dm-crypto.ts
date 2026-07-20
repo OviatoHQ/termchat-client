@@ -52,8 +52,20 @@ function keysDir(): string {
   return join(termchatHome(), "keys");
 }
 
-function identityPath(): string {
-  return join(keysDir(), "identity.key");
+/**
+ * Identity key path, scoped to the SIGNED-IN GitHub account. Two accounts on the same
+ * machine (or the same `TERMCHAT_HOME`) must NOT share a keypair — sharing one collapses
+ * E2E, because both accounts then publish the *same* public key and every DM between them
+ * (and their safety numbers) is encrypted to a key indistinguishable from self. Keyed by
+ * login → `keys/identity-<login>.key`. The bare `login`-less path is a legacy fallback
+ * only (DMs are login-only, so it's effectively unreachable in normal use).
+ */
+function identityPath(login: string | null): string {
+  if (!login) return join(keysDir(), "identity.key");
+  // GitHub logins are [A-Za-z0-9-]; lowercase + sanitize defensively for the filesystem
+  // (macOS is case-insensitive, so fold case to avoid Foo/foo aliasing to two files).
+  const safe = login.toLowerCase().replace(/[^a-z0-9-]/g, "_");
+  return join(keysDir(), `identity-${safe}.key`);
 }
 
 /** Fresh X25519 identity keypair (not persisted). */
@@ -62,9 +74,12 @@ export function generateIdentity(): Identity {
   return { privateKey, publicKey: x25519.getPublicKey(privateKey) };
 }
 
-/** Load this machine's identity, generating + persisting one (0600) on first use. */
+/** Load the signed-in account's identity, generating + persisting one (0600) on first
+ *  use. Keyed by the current GitHub login (from credentials) so two accounts never
+ *  collide on one machine — see {@link identityPath}. */
 export function loadOrCreateIdentity(): Identity {
-  const path = identityPath();
+  const login = readCredentials()?.githubLogin ?? null;
+  const path = identityPath(login);
   if (existsSync(path)) {
     const privateKey = fromB64(readFileSync(path, "utf8").trim());
     return { privateKey, publicKey: x25519.getPublicKey(privateKey) };

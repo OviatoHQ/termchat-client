@@ -10,7 +10,7 @@
  * tab's body starts at row 3. Every body line is exactly one row tall, so row math
  * is deterministic. These constants MUST track the render in App.tsx.
  */
-import { type TabId, windowStripCells } from "./nav.ts";
+import { type DmView, type TabId, windowStripCells } from "./nav.ts";
 
 /** 1-based row of the window strip (title/status bar is row 1). */
 export const TAB_ROW = 2;
@@ -27,6 +27,10 @@ export const BOUNTIES_LIST_OFFSET = 1;
 /** Rows of body chrome before the Calls session list (header, active-status line,
  *  subheader). */
 export const CALLS_LIST_OFFSET = 3;
+/** Rows of body chrome before the DMs inbox list. The inbox's FIRST body row is the
+ *  "+ Send new DM" action (no header chrome), so this is 0 — pinned by the dms-body
+ *  render test against DmsBody's actual output. */
+export const DMS_INBOX_OFFSET = 0;
 
 export type ClickTarget =
   | { kind: "tab"; tab: TabId }
@@ -34,7 +38,11 @@ export type ClickTarget =
   | { kind: "me-action"; index: number }
   | { kind: "bounty"; index: number }
   | { kind: "bounty-post" }
-  | { kind: "session"; index: number };
+  | { kind: "session"; index: number }
+  // DMs inbox row: index 0 = "+ Send new DM", index ≥1 = threads[index-1]. This
+  // convention is shared with activate("dms", index) and the nav reducer — keep in sync.
+  | { kind: "dm-row"; index: number }
+  | { kind: "dm-back" };
 
 export interface Region {
   /** 1-based top-left cell. */
@@ -52,6 +60,10 @@ export interface HitTestView {
   /** Total unread DMs — the window strip appends a `(N!)` badge that widens the DMs
    *  cell, so hit-testing must know it to keep later cells aligned. */
   dmUnread: number;
+  /** Which DMs sub-view is showing (only used when activeTab === "dms"). */
+  dmView: DmView;
+  /** Number of DM threads in the inbox (inbox rows = 1 "+ Send new DM" + this). */
+  dmThreadCount: number;
   expertsCount: number;
   meCount: number;
   bountiesCount: number;
@@ -104,6 +116,18 @@ export function bodyRegions(view: HitTestView): Region[] {
     for (let i = 0; i < view.sessionsCount; i++) {
       regions.push(rowFull(BODY_TOP + CALLS_LIST_OFFSET + i, { kind: "session", index: i }));
     }
+  } else if (view.activeTab === "dms") {
+    if (view.dmView === "inbox") {
+      // Row 0 = "+ Send new DM"; rows 1..n = the threads (index i → threads[i-1]).
+      const rows = 1 + view.dmThreadCount;
+      for (let i = 0; i < rows; i++) {
+        regions.push(rowFull(BODY_TOP + DMS_INBOX_OFFSET + i, { kind: "dm-row", index: i }));
+      }
+    } else if (view.dmView === "thread") {
+      // The "‹ see all DMs" back action is the first body row.
+      regions.push(rowFull(BODY_TOP, { kind: "dm-back" }));
+    }
+    // "new" composer has no clickable body rows (Esc cancels).
   }
   return regions;
 }
