@@ -59,7 +59,7 @@ export async function runInstall(args: string[]): Promise<void> {
 
   for (const adapter of adapters) {
     const options: InstallOptions = {
-      statusline: await decideStatusline(adapter, flags, interactive),
+      statusline: decideStatusline(adapter, flags, interactive),
     };
     if (flags.edge !== undefined) options.edge = flags.edge;
     report(adapter, adapter.install(options));
@@ -72,11 +72,11 @@ export async function runInstall(args: string[]): Promise<void> {
   }
 }
 
-async function decideStatusline(
+function decideStatusline(
   adapter: AgentAdapter,
   flags: InstallFlags,
   interactive: boolean,
-): Promise<boolean> {
+): boolean {
   // Agents without a command-backed status line (Codex) get hooks only — never prompt.
   if (!adapter.commandStatusLine) return false;
   // Non-interactive: honor an explicit flag, else default the status line ON (this
@@ -85,36 +85,32 @@ async function decideStatusline(
   return promptYesNo(`Add the termchat status line to ${label(adapter)}?`, true);
 }
 
-async function promptYesNo(question: string, defaultYes: boolean): Promise<boolean> {
+function promptYesNo(question: string, defaultYes: boolean): boolean {
   process.stdout.write(`${question} ${defaultYes ? "[Y/n]" : "[y/N]"} `);
-  const answer = (await readLine()).trim().toLowerCase();
+  const answer = readTtyLine().trim().toLowerCase();
   if (answer === "") return defaultYes;
   return answer === "y" || answer === "yes";
 }
 
 /**
- * Read one line from stdin without `readline`. Under `curl … | sh` the shim reattaches
- * stdin to `/dev/tty`; `readline`'s terminal handling forces the tty into raw/keypress
- * mode, which silently swallows input on a piped-shell `/dev/tty` (nodejs/node#21319).
- * Reading in the tty's default canonical mode instead lets the terminal driver echo and
- * line-edit, delivering the whole line on Enter. Resolves "" on EOF (Ctrl-D → default).
+ * Read one line from the controlling terminal by delegating to the shell's `read`
+ * builtin against `/dev/tty` — the one tty-read primitive that works everywhere.
+ *
+ * Bun's own stdin stream silently dropped terminal input on a `/dev/tty` reopened
+ * from inside a piped `curl … | sh` shell (both `readline`'s raw mode and a plain
+ * `data` listener failed live), so we never let Bun touch the terminal for the read:
+ * `/bin/sh` does it, and Bun only captures its stdout. If there is no readable tty
+ * (no controlling terminal, EOF, spawn failure) this returns "" and the caller falls
+ * back to its default — so the prompt degrades to the default and can never hang.
  */
-function readLine(): Promise<string> {
-  return new Promise((resolve) => {
-    const stdin = process.stdin;
-    const finish = (value: string) => {
-      stdin.off("data", onData);
-      stdin.off("end", onEnd);
-      stdin.pause();
-      resolve(value);
-    };
-    const onData = (chunk: string) => finish(chunk);
-    const onEnd = () => finish("");
-    stdin.setEncoding("utf8");
-    stdin.once("data", onData);
-    stdin.once("end", onEnd);
-    stdin.resume();
-  });
+function readTtyLine(): string {
+  try {
+    const proc = Bun.spawnSync(["sh", "-c", 'IFS= read -r reply </dev/tty; printf %s "$reply"']);
+    if (!proc.success) return "";
+    return proc.stdout.toString();
+  } catch {
+    return "";
+  }
 }
 
 function report(adapter: AgentAdapter, result: ReturnType<AgentAdapter["install"]>): void {
