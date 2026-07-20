@@ -1,4 +1,3 @@
-import { createInterface } from "node:readline/promises";
 import { detectAdapters } from "./adapters.ts";
 import type { AgentAdapter, InstallOptions } from "./agent-adapter.ts";
 import { printBanner } from "./banner.ts";
@@ -58,15 +57,12 @@ export async function runInstall(args: string[]): Promise<void> {
   const interactive =
     process.stdin.isTTY === true && flags.yes !== true && flags.statusline === undefined;
 
-  const rl = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : null;
-  try {
-    for (const adapter of adapters) {
-      const options: InstallOptions = { statusline: await decideStatusline(adapter, flags, rl) };
-      if (flags.edge !== undefined) options.edge = flags.edge;
-      report(adapter, adapter.install(options));
-    }
-  } finally {
-    rl?.close();
+  for (const adapter of adapters) {
+    const options: InstallOptions = {
+      statusline: await decideStatusline(adapter, flags, interactive),
+    };
+    if (flags.edge !== undefined) options.edge = flags.edge;
+    report(adapter, adapter.install(options));
   }
 
   if (!interactive) {
@@ -79,26 +75,46 @@ export async function runInstall(args: string[]): Promise<void> {
 async function decideStatusline(
   adapter: AgentAdapter,
   flags: InstallFlags,
-  rl: ReturnType<typeof createInterface> | null,
+  interactive: boolean,
 ): Promise<boolean> {
   // Agents without a command-backed status line (Codex) get hooks only — never prompt.
   if (!adapter.commandStatusLine) return false;
   // Non-interactive: honor an explicit flag, else default the status line ON (this
   // preserves the historical `curl … | sh --statusline` behavior for CI/pipes).
-  if (!rl) return flags.statusline ?? true;
-  return promptYesNo(rl, `Add the termchat status line to ${label(adapter)}?`, true);
+  if (!interactive) return flags.statusline ?? true;
+  return promptYesNo(`Add the termchat status line to ${label(adapter)}?`, true);
 }
 
-async function promptYesNo(
-  rl: ReturnType<typeof createInterface>,
-  question: string,
-  defaultYes: boolean,
-): Promise<boolean> {
-  const answer = (await rl.question(`${question} ${defaultYes ? "[Y/n]" : "[y/N]"} `))
-    .trim()
-    .toLowerCase();
+async function promptYesNo(question: string, defaultYes: boolean): Promise<boolean> {
+  process.stdout.write(`${question} ${defaultYes ? "[Y/n]" : "[y/N]"} `);
+  const answer = (await readLine()).trim().toLowerCase();
   if (answer === "") return defaultYes;
   return answer === "y" || answer === "yes";
+}
+
+/**
+ * Read one line from stdin without `readline`. Under `curl … | sh` the shim reattaches
+ * stdin to `/dev/tty`; `readline`'s terminal handling forces the tty into raw/keypress
+ * mode, which silently swallows input on a piped-shell `/dev/tty` (nodejs/node#21319).
+ * Reading in the tty's default canonical mode instead lets the terminal driver echo and
+ * line-edit, delivering the whole line on Enter. Resolves "" on EOF (Ctrl-D → default).
+ */
+function readLine(): Promise<string> {
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const finish = (value: string) => {
+      stdin.off("data", onData);
+      stdin.off("end", onEnd);
+      stdin.pause();
+      resolve(value);
+    };
+    const onData = (chunk: string) => finish(chunk);
+    const onEnd = () => finish("");
+    stdin.setEncoding("utf8");
+    stdin.once("data", onData);
+    stdin.once("end", onEnd);
+    stdin.resume();
+  });
 }
 
 function report(adapter: AgentAdapter, result: ReturnType<AgentAdapter["install"]>): void {
