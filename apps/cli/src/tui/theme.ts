@@ -20,8 +20,10 @@ export const C = {
   bg2: "#15170e",
   /** cards, tiles, inputs, highlighted-row solid (no alpha in terminals) */
   panel: "#1f2214",
-  /** highlighted-row background (lime-tinted, solid — terminals have no alpha) */
-  rowHighlight: "#2b301c",
+  /** selected-row/tab background — solid lavender block (the selection accent) */
+  rowHighlight: "#c3b7f5",
+  /** text on a selected row/tab (near-black, high contrast on the lavender block) */
+  rowHighlightFg: "#191b10",
   /** hairline borders, row rules */
   line: "#33361f",
   /** sub-row rules (fainter) */
@@ -80,6 +82,17 @@ export function cellWidth(s: string): number {
   let n = 0;
   for (const ch of s) n += ch === "⚡" || ch === "⭐" ? 2 : 1;
   return n;
+}
+
+/**
+ * Text color for a span inside a (possibly) selected row/tab. Selected rows render
+ * as a solid lavender block (`C.rowHighlight`) with uniform near-black text, so a
+ * selected span drops its normal semantic color (nick / lime / amber) for
+ * `C.rowHighlightFg`. Each Ink `<Text>` sets its own `color`, so a parent color does
+ * not cascade — every colored span must opt in via `selFg(active, …)`.
+ */
+export function selFg(active: boolean, base: string): string {
+  return active ? C.rowHighlightFg : base;
 }
 
 /** Glyph vocabulary — all unicode text, no image assets. */

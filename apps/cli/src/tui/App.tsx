@@ -41,7 +41,7 @@ import {
   windowByRows,
   windowTail,
 } from "./scroll.ts";
-import { C, G, cellWidth, nickColor } from "./theme.ts";
+import { C, G, cellWidth, nickColor, selFg } from "./theme.ts";
 import { ageShort, timeAgo } from "./timeago.ts";
 import { useMouse } from "./use-mouse.ts";
 
@@ -1354,8 +1354,8 @@ export function App({
         {winCells.map((cell) => (
           <Text
             key={cell.tab}
-            backgroundColor={C.barBg2}
-            color={cell.active ? C.barFg : cell.unread ? C.accent : "#b9b58c"}
+            backgroundColor={cell.active ? C.rowHighlight : C.barBg2}
+            color={cell.active ? C.rowHighlightFg : cell.unread ? C.accent : "#b9b58c"}
             bold={cell.active || cell.unread}
           >
             {cell.text}
@@ -1556,8 +1556,10 @@ export function CommandPalette({
         const on = c === matches[sel];
         return (
           <Text key={c.name} {...(on ? { backgroundColor: C.rowHighlight } : {})}>
-            <Text color={C.accent} bold={on}>{` ${`/${c.name}`.padEnd(12)} `}</Text>
-            <Text color={C.muted2}>{c.desc}</Text>
+            <Text color={selFg(on, C.accent)} bold={on}>{` ${`/${c.name}`.padEnd(12)} `}</Text>
+            <Text color={selFg(on, C.muted2)} bold={on}>
+              {c.desc}
+            </Text>
           </Text>
         );
       })}
@@ -1617,23 +1619,32 @@ export function ExpertsBody({
           const topics = e.topics.join(" ") || "any";
           return (
             <Text key={e.user} {...(active ? { backgroundColor: C.rowHighlight } : {})}>
-              <Text color={C.accent}>{active ? "›" : " "}</Text>
-              <Text color={e.online ? C.accent : C.muted}>
+              <Text color={selFg(active, C.accent)}>{active ? "›" : " "}</Text>
+              <Text color={selFg(active, e.online ? C.accent : C.muted)}>
                 {e.online ? ` ${G.online}` : ` ${G.offline}`}
               </Text>
-              <Text color={nickColor(e.user)} bold>{` ${e.user}`}</Text>
-              <Text color={C.accent}>
+              <Text color={selFg(active, nickColor(e.user))} bold>{` ${e.user}`}</Text>
+              <Text color={selFg(active, C.accent)} bold={active}>
                 {e.topExpert ? ` ${G.verified}${G.topExpert}` : ` ${G.verified}`}
               </Text>
-              <Text color={C.muted}>{`  ${topics}`}</Text>
-              <Text color={C.amber}>{`  $${e.rate}/min`}</Text>
-              <Text color={C.muted2}>{`  ${G.rating}${stars.replace("★", "")}`}</Text>
+              <Text color={selFg(active, C.muted)} bold={active}>{`  ${topics}`}</Text>
+              <Text color={selFg(active, C.amber)} bold={active}>{`  $${e.rate}/min`}</Text>
+              <Text
+                color={selFg(active, C.muted2)}
+                bold={active}
+              >{`  ${G.rating}${stars.replace("★", "")}`}</Text>
               {e.online ? (
-                <Text backgroundColor={C.accent} color={C.bg} bold>
+                <Text
+                  backgroundColor={active ? C.bg : C.accent}
+                  color={active ? C.rowHighlight : C.bg}
+                  bold
+                >
                   {" call "}
                 </Text>
               ) : (
-                <Text color={C.muted}>{" [bounty]"}</Text>
+                <Text color={selFg(active, C.muted)} bold={active}>
+                  {" [bounty]"}
+                </Text>
               )}
             </Text>
           );
@@ -1750,9 +1761,11 @@ export function BountiesBody({
           const postActive = sel === postIndex;
           return (
             <Text key="post" {...(postActive ? { backgroundColor: C.rowHighlight } : {})}>
-              <Text color={C.accent}>{postActive ? "›" : " "}</Text>
-              <Text color={C.accent}>{" [post a bounty]"}</Text>
-              <Text color={C.muted2}>
+              <Text color={selFg(postActive, C.accent)}>{postActive ? "›" : " "}</Text>
+              <Text color={selFg(postActive, C.accent)} bold={postActive}>
+                {" [post a bounty]"}
+              </Text>
+              <Text color={selFg(postActive, C.muted2)} bold={postActive}>
                 {"  money is held, not charged — you pay only when you accept"}
               </Text>
             </Text>
@@ -1764,13 +1777,18 @@ export function BountiesBody({
         const q = b.question.length > 44 ? `${b.question.slice(0, 43)}…` : b.question;
         return (
           <Text key={b.bountyId} {...(active ? { backgroundColor: C.rowHighlight } : {})}>
-            <Text color={C.accent}>{active ? "›" : " "}</Text>
-            <Text color={C.fg}>{` #${b.bountyId}`}</Text>
-            <Text color={C.amber}>{`  ${usd(b.priceCents)}`}</Text>
-            <Text color={C.muted}>{`  ${topic}`}</Text>
-            <Text color={C.fg2}>{`  "${q}"`}</Text>
-            <Text color={C.muted2}>{`  open ${ageShort(b.createdAt, now)}`}</Text>
-            <Text color={C.accent}>{"  [claim]"}</Text>
+            <Text color={selFg(active, C.accent)}>{active ? "›" : " "}</Text>
+            <Text color={selFg(active, C.fg)} bold={active}>{` #${b.bountyId}`}</Text>
+            <Text color={selFg(active, C.amber)} bold={active}>{`  ${usd(b.priceCents)}`}</Text>
+            <Text color={selFg(active, C.muted)} bold={active}>{`  ${topic}`}</Text>
+            <Text color={selFg(active, C.fg2)} bold={active}>{`  "${q}"`}</Text>
+            <Text
+              color={selFg(active, C.muted2)}
+              bold={active}
+            >{`  open ${ageShort(b.createdAt, now)}`}</Text>
+            <Text color={selFg(active, C.accent)} bold={active}>
+              {"  [claim]"}
+            </Text>
           </Text>
         );
       })}
@@ -1838,12 +1856,15 @@ export function CallsBody({
               : s.status;
         return (
           <Text key={s.sessionId} {...(active_ ? { backgroundColor: C.rowHighlight } : {})}>
-            <Text color={C.accent}>{active_ ? "›" : " "}</Text>
-            <Text color={C.fg}>{` #${s.sessionId}`}</Text>
-            <Text color={nickColor(s.peer)}>{` ${s.peer}`}</Text>
-            <Text color={C.muted}>{`  ${s.minutes}min`}</Text>
-            <Text color={C.amber}>{`  ${usd(s.amountCents)}`}</Text>
-            <Text color={s.reviewable ? C.accent : C.muted2}>{`  ${tag}`}</Text>
+            <Text color={selFg(active_, C.accent)}>{active_ ? "›" : " "}</Text>
+            <Text color={selFg(active_, C.fg)} bold={active_}>{` #${s.sessionId}`}</Text>
+            <Text color={selFg(active_, nickColor(s.peer))} bold={active_}>{` ${s.peer}`}</Text>
+            <Text color={selFg(active_, C.muted)} bold={active_}>{`  ${s.minutes}min`}</Text>
+            <Text color={selFg(active_, C.amber)} bold={active_}>{`  ${usd(s.amountCents)}`}</Text>
+            <Text
+              color={selFg(active_, s.reviewable ? C.accent : C.muted2)}
+              bold={active_}
+            >{`  ${tag}`}</Text>
           </Text>
         );
       })}
@@ -1894,8 +1915,8 @@ export function MeBody({
         const active = i === sel;
         return (
           <Text key={a.label} {...(active ? { backgroundColor: C.rowHighlight } : {})}>
-            <Text color={C.accent}>{active ? "›" : " "}</Text>
-            <Text color={active ? C.fgBright : C.fg} bold={active}>{` ${a.label}`}</Text>
+            <Text color={selFg(active, C.accent)}>{active ? "›" : " "}</Text>
+            <Text color={selFg(active, C.fg)} bold={active}>{` ${a.label}`}</Text>
           </Text>
         );
       })}
@@ -2031,8 +2052,8 @@ export function DmsBody({
         if (i === 0) {
           return (
             <Text key="new" {...(sel === 0 ? { backgroundColor: C.rowHighlight } : {})}>
-              <Text color={C.accent}>{sel === 0 ? "›" : " "}</Text>
-              <Text color={sel === 0 ? C.fgBright : C.accent} bold={sel === 0}>
+              <Text color={selFg(sel === 0, C.accent)}>{sel === 0 ? "›" : " "}</Text>
+              <Text color={selFg(sel === 0, C.accent)} bold={sel === 0}>
                 {" + Send new DM"}
               </Text>
             </Text>
@@ -2043,13 +2064,13 @@ export function DmsBody({
         const name = t.displayName ?? t.peer;
         return (
           <Text key={t.peer} {...(on ? { backgroundColor: C.rowHighlight } : {})}>
-            <Text color={C.accent}>{on ? "›" : " "}</Text>
+            <Text color={selFg(on, C.accent)}>{on ? "›" : " "}</Text>
             {/* unread marker: lime ● when unread, else a matching-width blank */}
-            <Text color={t.unread > 0 ? C.accent : C.muted2}>
+            <Text color={selFg(on, t.unread > 0 ? C.accent : C.muted2)}>
               {t.unread > 0 ? ` ${G.online}` : "  "}
             </Text>
-            <Text {...nickProps(name, on)}>{` @${name}`}</Text>
-            <Text color={C.muted2}>{`  ${timeAgo(t.lastTs, now)}`}</Text>
+            <Text color={selFg(on, nickColor(name))} bold={on}>{` @${name}`}</Text>
+            <Text color={selFg(on, C.muted2)} bold={on}>{`  ${timeAgo(t.lastTs, now)}`}</Text>
           </Text>
         );
       })}
