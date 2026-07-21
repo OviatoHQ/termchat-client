@@ -181,3 +181,108 @@ test("DM inbox: arrows move the selection, not the scroll (it's a list, not a tr
     selection: 2,
   });
 });
+
+// ---- lounge roster focus (Ctrl+U) + the member action menu ----
+
+const roster: NavState = { ...base, loungeFocus: "roster" };
+
+test("Ctrl+U toggles the keyboard between the composer and the roster", () => {
+  expect(reduceKey({ ...base, draft: "half-typed" }, "u", { ctrl: true })).toEqual({
+    type: "roster-focus",
+    focus: "roster",
+  });
+  expect(reduceKey(roster, "u", { ctrl: true })).toEqual({
+    type: "roster-focus",
+    focus: "composer",
+  });
+  // Ctrl+U outside the Lounge is not a roster key (those tabs are plain lists).
+  expect(reduceKey({ ...base, activeTab: "experts" }, "u", { ctrl: true })).toEqual({
+    type: "none",
+  });
+});
+
+test("roster focus: arrows move the highlight, Enter opens the menu, Esc leaves", () => {
+  expect(reduceKey(roster, "", { upArrow: true })).toEqual({ type: "roster-move", delta: -1 });
+  expect(reduceKey(roster, "", { downArrow: true })).toEqual({ type: "roster-move", delta: 1 });
+  expect(reduceKey(roster, "", { return: true })).toEqual({ type: "roster-menu-open" });
+  expect(reduceKey(roster, "", { escape: true })).toEqual({
+    type: "roster-focus",
+    focus: "composer",
+  });
+});
+
+test("roster focus drops printable keys (they must never leak into the chat draft)", () => {
+  const typed = { ...roster, draft: "half-typed" };
+  expect(reduceKey(typed, "x", {})).toEqual({ type: "none" });
+  expect(reduceKey(typed, "", { backspace: true })).toEqual({ type: "none" });
+});
+
+test("the roster menu is modal: it captures arrows/Enter/Esc and even Tab", () => {
+  const menu: NavState = { ...roster, rosterMenuOpen: true };
+  expect(reduceKey(menu, "", { upArrow: true })).toEqual({ type: "roster-menu-move", delta: -1 });
+  expect(reduceKey(menu, "", { downArrow: true })).toEqual({ type: "roster-menu-move", delta: 1 });
+  expect(reduceKey(menu, "", { return: true })).toEqual({ type: "roster-menu-accept" });
+  expect(reduceKey(menu, "", { tab: true })).toEqual({ type: "none" }); // no window switch
+  expect(reduceKey(menu, "x", {})).toEqual({ type: "none" });
+});
+
+test("Esc unwinds ONE level at a time: menu → roster focus → composer", () => {
+  const menu: NavState = { ...roster, rosterMenuOpen: true };
+  expect(reduceKey(menu, "", { escape: true })).toEqual({ type: "roster-menu-close" });
+  expect(reduceKey(roster, "", { escape: true })).toEqual({
+    type: "roster-focus",
+    focus: "composer",
+  });
+  // Back at the composer, Esc means what it always did — snap to the newest line.
+  expect(reduceKey(base, "", { escape: true })).toEqual({ type: "scroll", to: "bottom" });
+});
+
+test("Tab still switches windows while the roster (not its menu) has focus", () => {
+  expect(reduceKey(roster, "", { tab: true })).toEqual({ type: "switch-tab", tab: "dms" });
+});
+
+// ---- `@` mention autocomplete (rides alongside the composer; Tab completes) ----
+
+const mention: NavState = { ...base, draft: "hey @b", mentionOpen: true };
+
+test("the mention menu takes ↑/↓, Tab and Esc — but never Enter", () => {
+  expect(reduceKey(mention, "", { upArrow: true })).toEqual({ type: "mention-move", delta: -1 });
+  expect(reduceKey(mention, "", { downArrow: true })).toEqual({ type: "mention-move", delta: 1 });
+  expect(reduceKey(mention, "", { tab: true })).toEqual({ type: "mention-accept" });
+  expect(reduceKey(mention, "", { escape: true })).toEqual({ type: "mention-close" });
+  // Enter still SENDS: a mention sits mid-sentence, so stealing Enter would make every
+  // "hey @bob" take two presses.
+  expect(reduceKey(mention, "", { return: true })).toEqual({ type: "submit", line: "hey @b" });
+});
+
+test("typing and backspace keep editing the draft while the mention menu is open", () => {
+  expect(reduceKey(mention, "o", {})).toEqual({ type: "edit-draft", draft: "hey @bo" });
+  expect(reduceKey(mention, "", { backspace: true })).toEqual({
+    type: "edit-draft",
+    draft: "hey @",
+  });
+});
+
+test("Tab only completes a mention in the Lounge — elsewhere it still switches windows", () => {
+  expect(reduceKey({ ...mention, activeTab: "experts" }, "", { tab: true })).toEqual({
+    type: "switch-tab",
+    tab: "bounties",
+  });
+});
+
+test("Alt+1…Alt+6 jump straight to a window; a bare digit is still chat text", () => {
+  expect(reduceKey({ ...base, activeTab: "me" }, "1", { meta: true })).toEqual({
+    type: "switch-tab",
+    tab: "lounge",
+  });
+  expect(reduceKey(base, "4", { meta: true })).toEqual({ type: "switch-tab", tab: "bounties" });
+  expect(reduceKey(base, "6", { meta: true })).toEqual({ type: "switch-tab", tab: "me" });
+  // Out of range, and unmodified digits, fall through to normal handling.
+  expect(reduceKey(base, "7", { meta: true })).toEqual({ type: "none" });
+  expect(reduceKey({ ...base, draft: "on " }, "1", {})).toEqual({
+    type: "edit-draft",
+    draft: "on 1",
+  });
+  // A pending login code owns the keyboard — no jumping mid-paste.
+  expect(reduceKey({ ...base, locked: true }, "3", { meta: true })).toEqual({ type: "none" });
+});

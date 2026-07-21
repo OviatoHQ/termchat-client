@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { render } from "ink-testing-library";
 import { LoungeClient, type WebSocketLike } from "../src/lounge-client.ts";
 import { App } from "../src/tui/App.tsx";
+import { VERSION, VERSION_LABEL } from "../src/version.ts";
 
 class FakeSocket implements WebSocketLike {
   private handlers = new Map<string, Array<(event: { data?: unknown }) => void>>();
@@ -52,7 +53,7 @@ test("renders the lounge chrome, roster, and messages (App seeds from client sta
   expect(frame).toContain("termchat");
   expect(frame).toContain("#RUST"); // roster header for the current room
   expect(frame).toContain("alice ✓ rust"); // verified roster entry with coarse topic
-  expect(frame).toContain("4 online"); // 1 member + 3 guests in the olive top bar
+  expect(frame).not.toContain("online"); // the presence count was dropped from the top bar
   expect(frame).toContain("bob");
   expect(frame).toContain("hey alice");
 });
@@ -70,22 +71,24 @@ test("renders the numbered window strip with lounge active by default", () => {
   const { client } = setup("alice");
   const { lastFrame } = render(<App client={client} user="alice" staticInput />);
   const frame = lastFrame() ?? "";
-  expect(frame).toContain("[1:lounge]"); // active window is bracketed
-  expect(frame).toContain("2:dms"); // the DMs window (docs/DMS.md stage 3b)
-  expect(frame).toContain("3:experts");
-  expect(frame).toContain("5:calls");
-  expect(frame).toContain("6:me");
+  expect(frame).toContain("[LOUNGE]"); // active window is bracketed, uppercase, unnumbered
+  expect(frame).toContain("DMS"); // the DMs window (docs/DMS.md stage 3b)
+  expect(frame).toContain("EXPERTS");
+  expect(frame).toContain("CALLS");
+  expect(frame).toContain("ME");
+  expect(frame).not.toContain("1:"); // window numbers are no longer drawn
 });
 
-// Pin the layout the hit-tester assumes (BODY_TOP=3): the top bar on line 0, the window
-// strip on line 1, so window clicks at row 2 and bodies from row 3 route correctly. If
-// someone inserts a header line, this fails instead of clicks silently landing a row off.
+// Pin the layout the hit-tester assumes (TAB_ROW=2, BODY_TOP=3): the olive top bar on
+// line 0 and the window strip on line 1, so window clicks at row 2 and bodies from row 3
+// route correctly. If someone inserts a header line, this fails instead of clicks
+// silently landing a row off.
 test("layout: top bar is line 0 and the window strip is line 1 (anchors hit-test rows)", () => {
   const { client } = setup("alice");
   const { lastFrame } = render(<App client={client} user="alice" staticInput />);
   const lines = (lastFrame() ?? "").split("\n");
   expect(lines[0]).toContain("termchat");
-  expect(lines[1]).toContain("[1:lounge]");
+  expect(lines[1]).toContain("[LOUNGE]");
 });
 
 test("anonymous guest shows its assigned name and a live prompt (not read-only)", () => {
@@ -150,4 +153,13 @@ test("wrapping messages never overflow the box, and the newest hugs the divider"
     (process.stdout as unknown as { columns: number | undefined }).columns = prevCols;
     (process.stdout as unknown as { rows: number | undefined }).rows = prevRows;
   }
+});
+
+test("the header shows the manifest version, and 'dev' while unstamped", () => {
+  const { client } = setup("alice");
+  const frame = render(<App client={client} user="alice" staticInput />).lastFrame() ?? "";
+  // A release stamps apps/cli/package.json; until then the label reads `dev`, never the
+  // raw 0.0.0 placeholder (which looks like a broken build).
+  expect(frame).toContain(`termchat ${VERSION_LABEL}`);
+  expect(VERSION_LABEL).toBe(VERSION === "0.0.0" ? "dev" : VERSION);
 });
