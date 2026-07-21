@@ -138,3 +138,150 @@ test("an identical rejection doesn't stack a new line each time", async () => {
   const hits = (lastFrame() ?? "").split("Sign in with /login first.").length - 1;
   expect(hits).toBe(1);
 });
+
+test("a call fired from the Lounge shows its outcome there, not just on a market tab", async () => {
+  // The bug: `/call --code … @afxal …` from the Lounge left "Calling afxal (free call)…"
+  // up forever. The edge HAD answered ("afxal isn't online right now") — but that answer
+  // only draws in the market log, which the Lounge doesn't show. The call looked live and
+  // was already dead. The outcome now mirrors onto the notice row, which every tab draws.
+  const { lastFrame, stdin, mkt } = setup("alice");
+  await settle();
+  stdin.write("/call --code LFGGG @afxal hello");
+  await settle();
+  stdin.write("\r");
+  await settle();
+  expect(lastFrame() ?? "").toContain("Calling afxal (free call)…");
+  mkt.deliver({ type: "system", text: "afxal isn't online right now." });
+  await settle();
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("[LOUNGE]"); // still standing in the Lounge
+  expect(frame).toContain("afxal isn't online right now.");
+  expect(frame).not.toContain("Calling afxal (free call)…"); // the dead call is gone
+});
+
+test("ordinary market chatter never colonises the notice row", async () => {
+  const { lastFrame, mkt } = setup("alice");
+  await settle();
+  // No call in flight → a system message belongs in the market log only.
+  mkt.deliver({ type: "system", text: "Sign in with /login first." });
+  await settle();
+  expect(lastFrame() ?? "").not.toContain("Sign in with /login first.");
+});
+
+test("an incoming call reaches the expert in the Lounge, in amber, with how to answer", async () => {
+  // The other half of the same bug: `summon_request` only ever rendered in the market
+  // log, so an expert sitting on the default tab was never told anyone was calling —
+  // the caller watched "waiting…" until it expired against a live, idle expert.
+  const { lastFrame, mkt } = setup("alice");
+  await settle();
+  mkt.deliver({
+    type: "summon_request",
+    reqId: "r1",
+    from: "bob",
+    topic: null,
+    problem: "hello",
+    rate: 2,
+    maxMinutes: 30,
+    free: true,
+  });
+  await settle();
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("[LOUNGE]"); // never left the chat tab
+  expect(frame).toContain("bob needs help");
+  expect(frame).toContain("/accept");
+  expect(frame).toContain("/decline");
+  expect(frame).toContain("⚡"); // ⚡ — the amber call marker
+});
+
+test("a live session shows on the chat tabs, and stops looking live when it ends", async () => {
+  const { lastFrame, mkt } = setup("alice");
+  await settle();
+  mkt.deliver({
+    type: "session_start",
+    sessionId: 7,
+    peer: "bob",
+    role: "seeker",
+    rate: 2,
+    maxMinutes: 30,
+    problem: "hello",
+  });
+  await settle();
+  expect(lastFrame() ?? "").toContain("session #7 with bob");
+  mkt.deliver({
+    type: "session_end",
+    sessionId: 7,
+    role: "seeker",
+    minutes: 3,
+    chargeCents: 600,
+    feeCents: 60,
+    payoutCents: 540,
+    reason: "ended",
+  });
+  await settle();
+  expect(lastFrame() ?? "").toContain("session #7 ended");
+});
+
+test("an invitation someone else answered stops flashing", async () => {
+  // Two experts get the same offer; the other one accepts. Without this, the loser's
+  // amber "come help bob — /accept" sat up forever, and /accept only said it was gone.
+  const { lastFrame, mkt } = setup("alice");
+  await settle();
+  mkt.deliver({
+    type: "summon_request",
+    reqId: "r1",
+    from: "bob",
+    topic: null,
+    problem: "hello",
+    rate: 2,
+    maxMinutes: 30,
+  });
+  await settle();
+  expect(lastFrame() ?? "").toContain("/accept");
+  mkt.deliver({ type: "summon_closed", reqId: "r1" });
+  await settle();
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("answered by someone else");
+  expect(frame).not.toContain("bob needs help");
+});
+
+test("an offer's own refusals reach the recipient too, not just the caller", async () => {
+  // Accepting a beaten offer is answered by a `system` line. The recipient never typed
+  // /call, so a caller-only rule would leave that answer stuck in the market log.
+  const { lastFrame, mkt } = setup("alice");
+  await settle();
+  mkt.deliver({
+    type: "summon_request",
+    reqId: "r1",
+    from: "bob",
+    topic: null,
+    problem: "hello",
+    rate: 2,
+    maxMinutes: 30,
+  });
+  await settle();
+  mkt.deliver({ type: "system", text: "That request is gone (taken or cancelled)." });
+  await settle();
+  expect(lastFrame() ?? "").toContain("That request is gone");
+});
+
+test("declining retracts the invitation, which the edge answers with silence", async () => {
+  const { lastFrame, stdin, mkt } = setup("alice");
+  await settle();
+  mkt.deliver({
+    type: "summon_request",
+    reqId: "r1",
+    from: "bob",
+    topic: null,
+    problem: "hello",
+    rate: 2,
+    maxMinutes: 30,
+  });
+  await settle();
+  stdin.write("/decline");
+  await settle();
+  stdin.write("\r");
+  await settle();
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Declined.");
+  expect(frame).not.toContain("bob needs help");
+});

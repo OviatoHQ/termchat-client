@@ -10,7 +10,7 @@ import {
   TopicTag,
 } from "@termchat/protocol";
 import { Box, Text, useApp, useInput } from "ink";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { beginLogin, submitLoginCode } from "../auth.ts";
 import { billingLinkNotice, dashboardNotice } from "../billing.ts";
 import { type Command, type CommandInfo, matchCommands, parseCommand } from "../commands.ts";
@@ -59,6 +59,25 @@ import { useMouse } from "./use-mouse.ts";
  *  orphan fragment (`<user>`) hanging above the prompt. `/help` prints the full list. */
 /** Tabs the marketplace event log is shown on — the ones whose actions produce it. */
 const MARKET_TABS: ReadonlySet<TabId> = new Set<TabId>(["experts", "bounties", "calls", "me"]);
+
+/** How the notice row reads a message. `call` is amber + ⚡ (a call being placed or
+ *  running — the one status that outlives the glance that dismissed it); `alert` is the
+ *  danger red of a call that died; everything else is a muted, forgettable hint. */
+type NoticeTone = "idle" | "call" | "alert";
+
+const NOTICE_COLOR: Record<NoticeTone, string> = {
+  idle: C.muted,
+  call: C.amber,
+  alert: C.danger,
+};
+
+/** The replies that answer the CALLER's `/call` short of a session starting: it's
+ *  waiting, or it's dead and here's why (`system` carries every refusal — offline
+ *  target, bad promo code, no card). `session_start`/`session_end` are handled
+ *  unconditionally, since they also reach the accepter, who has no call pending. */
+const CALL_OUTCOMES: ReadonlySet<ServerMarketplaceMessage["type"]> = new Set<
+  ServerMarketplaceMessage["type"]
+>(["summon_pending", "no_experts", "system"]);
 
 const IDLE_HINT = "type to chat · /help commands · Ctrl+U roster · Tab window";
 
@@ -225,7 +244,12 @@ function fmtMarket(m: ServerMarketplaceMessage): string {
         ? `call sent to ${m.target} — waiting for them to accept…`
         : `call sent to ${m.candidates} expert(s) — waiting…`;
     case "no_experts":
-      return `no experts available under $${m.maxRate}/min${m.topic ? ` for ${m.topic}` : ""}`;
+      // A declined call comes back as `no_experts` too (the edge re-offers to whoever is
+      // left; nobody left = this). A free call carries no rate cap, so quoting "under
+      // $0/min" would blame a price that was never the reason — say what happened.
+      return m.maxRate === 0
+        ? "nobody took the call"
+        : `no experts available under $${m.maxRate}/min${m.topic ? ` for ${m.topic}` : ""}`;
     case "summon_request":
       return m.free
         ? `⚡ ${m.from} needs help${m.topic ? ` (${m.topic})` : ""} — FREE CALL (no payout) up to ${m.maxMinutes}min: "${m.problem}" — /accept`
@@ -307,8 +331,31 @@ export function App({
     initialDmController?.getState() ?? null,
   );
   const [draft, setDraft] = useState("");
-  const [notice, setNotice] = useState<string>(initialNotice ?? IDLE_HINT);
+  const [notice, setNoticeText] = useState<string>(initialNotice ?? IDLE_HINT);
+  const [noticeTone, setNoticeTone] = useState<NoticeTone>("idle");
+  // Every notice carries a tone; "idle" (muted grey, the default) keeps all 70-odd
+  // existing callers unchanged. A call in flight or live is the one thing that must not
+  // read as another dismissible hint, so it takes amber — the palette's money color,
+  // whose remit already names `⚡ summon` (theme.ts).
+  // A functional updater (used to retract a notice only if it's still the one you set)
+  // leaves the tone alone: it can't know what text it will produce, and guessing "idle"
+  // would silently strip the amber off a live call it didn't touch.
+  const setNotice = useCallback(
+    (text: string | ((prev: string) => string), tone: NoticeTone = "idle"): void => {
+      setNoticeText(text);
+      if (typeof text === "string") setNoticeTone(tone);
+    },
+    [],
+  );
   const [mktLog, setMktLog] = useState<string[]>([]);
+  // True from the moment a `/call` is sent until the edge resolves it. The market log
+  // only draws on the market tabs (see MARKET_TABS — deliberate: un-gated it once
+  // spammed the Lounge), so a call fired from the Lounge would otherwise show an
+  // optimistic "Calling …" notice and NEVER the server's answer — "afxal isn't online",
+  // "that promo code isn't valid" — leaving a live-looking call that was already dead.
+  // While this is set, the outcome is mirrored into the always-visible notice row.
+  // A ref, not state: the subscribe closure below must read it without re-subscribing.
+  const callPending = useRef(false);
   // Identity/session state is mutable so /login and /logout work in place.
   const [user, setUser] = useState<string | null>(initialUser);
   const [token, setToken] = useState<string | null>(initialToken ?? null);
@@ -423,7 +470,7 @@ export function App({
     // prod token pointed at a local `wrangler dev` also lands here — deleting them would
     // throw away a working session just because you ran the edge locally.
     setNotice("This session isn't valid on this server — /login to sign back in.");
-  }, [user, state.self, state.verified, marketplace, dmController]);
+  }, [user, state.self, state.verified, marketplace, dmController, setNotice]);
 
   useEffect(() => {
     if (!marketplace) return;
@@ -441,12 +488,41 @@ export function App({
         setSessions(m.sessions);
         return;
       }
+      const line = fmtMarket(m);
       setMktLog((log) => {
         // Collapse an immediate repeat: a rejected request retried on every tab switch
         // stacked identical lines until the log filled the pane. One is the information.
-        const line = fmtMarket(m);
         return log.at(-1) === line ? log : [...log, line].slice(-MKT_LOG_MAX);
       });
+      // Both ends of a call report on the notice row, which EVERY tab draws — the market
+      // log alone reaches neither party where they actually sit (the Lounge).
+      if (m.type === "summon_request") {
+        // Someone is calling YOU. Nothing else in the app is time-critical like this: it
+        // expires unanswered, and the caller is watching a "waiting…" line the whole
+        // time. Amber, on whatever tab you're on, with the verb to answer it.
+        setNotice(`${line} or /decline`, "call");
+        // Now a party to this call: whatever answers your /accept — including the edge's
+        // "that request is gone" — is about the call, so route it here too.
+        callPending.current = true;
+      } else if (m.type === "summon_closed") {
+        // Someone else took it. Retract the amber invitation rather than leaving you
+        // staring at a call to answer that would only tell you it's gone.
+        setNotice("That call was answered by someone else.");
+        callPending.current = false;
+      } else if (m.type === "session_start") {
+        setNotice(line, "call"); // live — for the accepter too, who had no call pending
+        callPending.current = false;
+      } else if (m.type === "session_end") {
+        setNotice(line); // back to an ordinary muted line; the call is over
+        callPending.current = false;
+      } else if (callPending.current && CALL_OUTCOMES.has(m.type) && line) {
+        // Scoped to a call in flight so ordinary market chatter never colonises the row.
+        // A refusal (`system`) or an empty auction is the call dying — red, not amber.
+        setNotice(line, m.type === "system" || m.type === "no_experts" ? "alert" : "call");
+        // `summon_pending` is progress ("waiting for them to accept…"), not the end —
+        // stay armed so the accept/decline/failure that follows also lands here.
+        if (m.type !== "summon_pending") callPending.current = false;
+      }
       // Opening a session pops the relay-only audio call page in the browser + starts
       // the local in-call meter shown in both status bars, and records call.json so the
       // presence daemon can render the same meter in the Claude Code status line.
@@ -472,7 +548,7 @@ export function App({
         writeCallState(null);
       }
     });
-  }, [marketplace, session, token, onCall]);
+  }, [marketplace, session, token, onCall, setNotice]);
 
   // ---- identity: /login (guest → verified) and /logout (verified → guest) ----
   const doLogin = (): void => {
@@ -581,19 +657,29 @@ export function App({
           ...(command.target ? { target: command.target } : {}),
           ...(command.code ? { code: command.code } : {}),
         });
+        callPending.current = true;
         setNotice(
           command.code
             ? `Calling ${command.target} (free call)…`
             : command.target
               ? `Calling ${command.target}…`
               : "Looking for an expert…",
+          "call",
         );
         return;
       case "accept":
         if (!marketplace.accept(command.reqId)) setNotice("No pending offer to accept.");
         return;
       case "decline":
-        if (!marketplace.decline(command.reqId)) setNotice("No pending offer to decline.");
+        if (!marketplace.decline(command.reqId)) {
+          setNotice("No pending offer to decline.");
+        } else {
+          // The edge answers a decline with silence (it re-offers to the rest of the
+          // pool), so nothing else will ever retract the amber invitation — do it here,
+          // or a declined call goes on flashing as if it were still yours to answer.
+          setNotice("Declined.");
+          callPending.current = false;
+        }
         return;
       case "end":
         marketplace.end();
@@ -1083,11 +1169,12 @@ export function App({
       return;
     }
     marketplace.summon({ problem, maxRate: e.rate, target: e.user });
+    callPending.current = true;
     setSummonExpert(null);
     setDraft("");
     setActiveTab("lounge");
     setSelection(0);
-    setNotice(`Calling ${e.user} @ ≤ $${e.rate}/min…`);
+    setNotice(`Calling ${e.user} @ ≤ $${e.rate}/min…`, "call");
   };
 
   // ---- scroll geometry: row budgets + windows shared by the wheel/key handlers AND
@@ -1104,7 +1191,9 @@ export function App({
   // same way it draws instead of guessing — otherwise a 2-row notice overflows the box and
   // corrupts the redraw (the very bug this whole change fixes for the transcript).
   const noticeRows = wrappedRows(
-    `[${state.self ?? user ?? "guest"}(✓)] ${notice}`,
+    // Measure exactly what draws, ⚡ prefix included (2 cells) — the row budget below is
+    // only safe while this string and the notice JSX stay the same shape.
+    `[${state.self ?? user ?? "guest"}(✓)] ${noticeTone === "call" ? `${G.summon} ` : ""}${notice}`,
     Math.max(1, cols),
   );
   // An open autocomplete menu draws BETWEEN the notice and the input, so its rows are
@@ -1888,10 +1977,14 @@ export function App({
           footer allowance), so it costs no extra height and closes the old blank gap. */}
       <Text color={C.line}>{"─".repeat(Math.max(1, cols))}</Text>
 
-      {/* notice row: `[nick(✓)]` + the transient status/help message */}
+      {/* notice row: `[nick(✓)]` + the transient status/help message. A call in flight
+          or live takes amber + ⚡ and a dead one red — this row is the ONLY place a call
+          reports back on the chat tabs (the market log draws on market tabs alone), so
+          it can't look like the muted hint you've already learned to ignore. */}
       <Text>
         <Text color={C.muted2}>{`[${selfTag}] `}</Text>
-        <Text color={C.muted}>
+        <Text color={NOTICE_COLOR[noticeTone]}>
+          {noticeTone === "call" ? `${G.summon} ` : ""}
           {notice}
           {dmUnread > 0 ? ` · ✉ ${dmUnread} unread DM${dmUnread === 1 ? "" : "s"}` : ""}
         </Text>
