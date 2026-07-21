@@ -22,7 +22,9 @@ import type { ChatLine, LoungeClient, LoungeState } from "../lounge-client.ts";
 import { MarketplaceClient } from "../marketplace-client.ts";
 import { openUrl } from "../open-url.ts";
 import { PresenceNotifyClient } from "../presence-notify.ts";
+import { VERSION_LABEL } from "../version.ts";
 import {
+  BODY_TOP,
   BOUNTIES_LIST_OFFSET,
   CALLS_LIST_OFFSET,
   DMS_INBOX_OFFSET,
@@ -33,7 +35,14 @@ import {
 } from "./hit-test.ts";
 import { wrappedRows } from "./measure.ts";
 import type { MouseEvent } from "./mouse.ts";
-import { type DmView, type ScrollTo, type TabId, reduceKey, windowStripCells } from "./nav.ts";
+import {
+  type DmView,
+  type LoungeFocus,
+  type ScrollTo,
+  type TabId,
+  reduceKey,
+  windowStripCells,
+} from "./nav.ts";
 import {
   listWindow,
   rawOffsetForAnchor,
@@ -41,9 +50,17 @@ import {
   windowByRows,
   windowTail,
 } from "./scroll.ts";
-import { C, G, cellWidth, nickColor, selFg } from "./theme.ts";
+import { C, G, cellWidth, selFg } from "./theme.ts";
 import { ageShort, timeAgo } from "./timeago.ts";
 import { useMouse } from "./use-mouse.ts";
+
+/** The idle notice: what sits above the input when nothing else needs saying. Kept SHORT
+ *  on purpose — the notice row wraps, and a line that spills onto a second row leaves an
+ *  orphan fragment (`<user>`) hanging above the prompt. `/help` prints the full list. */
+/** Tabs the marketplace event log is shown on — the ones whose actions produce it. */
+const MARKET_TABS: ReadonlySet<TabId> = new Set<TabId>(["experts", "bounties", "calls", "me"]);
+
+const IDLE_HINT = "type to chat · /help commands · Ctrl+U roster · Tab window";
 
 const HELP_LINES = [
   "chat: /nick <name> · /join <room> · /rooms · /topic <tag> · /who · /dm <user> [msg] · /report <user>",
@@ -77,6 +94,14 @@ export function nickIntent(rawName: string, isVerified: boolean): NickIntent {
     return { kind: "invalid", message: "Nick must be 2–24 chars: letters, digits, - or _." };
   }
   return isVerified ? { kind: "confirm", name: parsed.data } : { kind: "apply", name: parsed.data };
+}
+
+/** One row of the roster member's action menu (Ctrl+U → ↑/↓ → Enter, or a click). Built
+ *  per-person: no "Send DM" on your own row, and the call/bounty row only exists when
+ *  the marketplace lists that handle as an expert. */
+export interface RosterMenuItem {
+  kind: "dm" | "tag" | "call" | "bounty";
+  label: string;
 }
 
 export interface AppProps {
@@ -168,10 +193,24 @@ function clock(secs: number): string {
   return `${String(Math.floor(secs / 60)).padStart(2, "0")}:${String(secs % 60).padStart(2, "0")}`;
 }
 
-/** The color for a chat/roster nick: self renders bright; others hash to a stable
- *  color from the "wire" nick palette. */
-function nickProps(handle: string, isSelf: boolean): { color: string; bold?: boolean } {
-  return isSelf ? { color: C.fgBright, bold: true } : { color: nickColor(handle) };
+/**
+ * The `@…` handle being typed at the END of a draft, lowercased and without its `@`, or
+ * null when the trailing word isn't a mention. `"hi @bo"` → `"bo"`, `"hi @bob "` → null
+ * (the word is finished), `"a@b"` → null (an `@` mid-word is an email, not a mention).
+ * A bare `"@"` returns `""`, which lists everyone — same as a bare `/`.
+ */
+export function mentionPrefix(draft: string): string | null {
+  const word = draft.split(/\s/).at(-1) ?? "";
+  if (!word.startsWith("@")) return null;
+  const q = word.slice(1);
+  // Handles are the nick alphabet; anything else means this isn't a handle being typed.
+  return /^[a-z0-9_-]*$/i.test(q) ? q.toLowerCase() : null;
+}
+
+/** The color for a chat/roster nick: YOU render bright + bold, everyone else shares one
+ *  color (`C.nick`), so your own handle is the only thing that stands out. */
+function nickProps(isSelf: boolean): { color: string; bold?: boolean } {
+  return isSelf ? { color: C.fgBright, bold: true } : { color: C.nick };
 }
 
 /** Render a marketplace event as a single transcript-style line. */
@@ -268,7 +307,7 @@ export function App({
     initialDmController?.getState() ?? null,
   );
   const [draft, setDraft] = useState("");
-  const [notice, setNotice] = useState<string>(initialNotice ?? HELP_LINES[0] ?? "");
+  const [notice, setNotice] = useState<string>(initialNotice ?? IDLE_HINT);
   const [mktLog, setMktLog] = useState<string[]>([]);
   // Identity/session state is mutable so /login and /logout work in place.
   const [user, setUser] = useState<string | null>(initialUser);
@@ -289,6 +328,16 @@ export function App({
   const [dmAnchor, setDmAnchor] = useState<string | null>(null);
   // Highlighted row in the `/` command autocomplete menu.
   const [paletteSel, setPaletteSel] = useState(0);
+  // Highlighted row in the `@` mention menu, and the draft an Esc dismissed it against.
+  const [mentionSel, setMentionSel] = useState(0);
+  const [mentionDismissed, setMentionDismissed] = useState<string | null>(null);
+  // Lounge roster focus (Ctrl+U). The selection is keyed by HANDLE, not index: the roster
+  // reorders live as presence changes, so an index would slide the highlight onto someone
+  // else between keypresses — and Enter would then DM the wrong person.
+  const [loungeFocus, setLoungeFocus] = useState<LoungeFocus>("composer");
+  const [rosterSelUser, setRosterSelUser] = useState<string | null>(null);
+  const [rosterMenuOpen, setRosterMenuOpen] = useState(false);
+  const [rosterMenuSel, setRosterMenuSel] = useState(0);
   // DMs "compose a new DM" mode: the inbox's "+ Send new DM" row switches the bottom
   // bar to an "@username …" composer. Cleared when a thread opens or we leave the tab.
   const [dmComposeNew, setDmComposeNew] = useState(false);
@@ -357,6 +406,25 @@ export function App({
     return () => notify.close();
   }, [dmController, session, token]);
 
+  // The SERVER decides who you are. If we hold saved credentials but the lounge says this
+  // socket is unverified, that token is dead (expired, or issued by another environment):
+  // stand down to guest instead of keeping a marketplace socket whose every frame the edge
+  // answers with "sign in first" — which is exactly how one stale token turned each tab
+  // switch into another line of rejection spam.
+  useEffect(() => {
+    if (!user || state.self === null || state.verified) return;
+    marketplace?.close();
+    setMarketplace(undefined);
+    dmController?.close();
+    setDmController(undefined);
+    setUser(null);
+    setToken(null);
+    // NB: the saved credentials are deliberately left on disk. They carry no host, so a
+    // prod token pointed at a local `wrangler dev` also lands here — deleting them would
+    // throw away a working session just because you ran the edge locally.
+    setNotice("This session isn't valid on this server — /login to sign back in.");
+  }, [user, state.self, state.verified, marketplace, dmController]);
+
   useEffect(() => {
     if (!marketplace) return;
     return marketplace.subscribe((m) => {
@@ -373,7 +441,12 @@ export function App({
         setSessions(m.sessions);
         return;
       }
-      setMktLog((log) => [...log, fmtMarket(m)].slice(-MKT_LOG_MAX));
+      setMktLog((log) => {
+        // Collapse an immediate repeat: a rejected request retried on every tab switch
+        // stacked identical lines until the log filled the pane. One is the information.
+        const line = fmtMarket(m);
+        return log.at(-1) === line ? log : [...log, line].slice(-MKT_LOG_MAX);
+      });
       // Opening a session pops the relay-only audio call page in the browser + starts
       // the local in-call meter shown in both status bars, and records call.json so the
       // presence daemon can render the same meter in the Claude Code status line.
@@ -797,6 +870,34 @@ export function App({
   const paletteOpen = paletteMatches.length > 0;
   const palSel = paletteOpen ? Math.min(paletteSel, paletteMatches.length - 1) : 0;
 
+  // `@` mention autocomplete — the same idea as the `/` menu, over who's actually in the
+  // room. Matches on the LAST word of the draft (the composer only ever appends, so the
+  // word being typed is the trailing one) and never on yourself. Dismissed with Esc: the
+  // dismissal is remembered against that exact draft, so the menu doesn't spring straight
+  // back on the next render but does return as soon as you type another character.
+  const mentionQuery = mentionPrefix(draft);
+  const mentionMatches: readonly string[] =
+    activeTab === "lounge" &&
+    !summonExpert &&
+    !pendingLogin &&
+    !pendingNick &&
+    !paletteOpen &&
+    // Composer only. Ctrl+U doesn't clear the draft, so a half-typed `@bob` would
+    // otherwise keep the mention menu alive underneath roster focus — and since the
+    // mention branch sits above the roster branch in the reducer, ↑/↓ would drive the
+    // wrong list. (The branch ORDER is load-bearing: it's what lets Tab complete a
+    // mention while still switching windows from roster focus. Gate here, not there.)
+    loungeFocus === "composer" &&
+    mentionQuery !== null &&
+    mentionDismissed !== draft
+      ? state.members
+          .map((m) => m.user)
+          .filter((u) => u !== who && u.toLowerCase().startsWith(mentionQuery))
+          .slice(0, 8)
+      : [];
+  const mentionOpen = mentionMatches.length > 0;
+  const mentionIdx = mentionOpen ? Math.min(mentionSel, mentionMatches.length - 1) : 0;
+
   // ---- Me tab: account actions as a selectable, Enter-activatable list ----
   const meActions: { label: string; run: () => void }[] = user
     ? [
@@ -852,14 +953,31 @@ export function App({
               : 0;
   const sel = itemCount > 0 ? Math.min(selection, itemCount - 1) : 0;
 
+  // Roster focus/menu teardown, shared by Esc, tab switches, and every menu action. The
+  // help line only gets restored if we were actually in roster focus, so an unrelated tab
+  // switch can't wipe a notice someone else just set.
+  const closeRosterFocus = (): void => {
+    if (loungeFocus === "roster") setNotice(IDLE_HINT);
+    setLoungeFocus("composer");
+    setRosterMenuOpen(false);
+    setRosterMenuSel(0);
+  };
+
   const switchTab = (tab: TabId): void => {
     setActiveTab(tab);
     setSelection(0);
     setLoungeAnchor(null); // re-pin the lounge to the newest line on every tab switch
+    closeRosterFocus(); // leaving the Lounge hands the keyboard back to the composer
     setSummonExpert(null); // leaving Experts abandons an open summon-confirm
-    if (tab === "experts") marketplace?.experts(); // refresh the directory on entry
-    if (tab === "bounties") marketplace?.bounties(); // refresh the board on entry
-    if (tab === "calls") marketplace?.mySessions(); // refresh your sessions on entry
+    // Refresh a tab's data on entry — but ONLY when signed in. A guest (or a stale
+    // token) has a marketplace socket the edge answers with "sign in first" for every
+    // frame, so an un-gated refresh spammed that rejection into the log on each tab
+    // switch. The tabs already render their own sign-in wall; nothing to fetch.
+    if (marketplace && user) {
+      if (tab === "experts") marketplace.experts(); // refresh the directory on entry
+      if (tab === "bounties") marketplace.bounties(); // refresh the board on entry
+      if (tab === "calls") marketplace.mySessions(); // refresh your sessions on entry
+    }
     if (tab === "dms") {
       // Land on the inbox ("show all my DMs"): close any open thread and cancel compose.
       // closeThread() also reloads the inbox; if signed out there's nothing to close.
@@ -975,7 +1093,12 @@ export function App({
   // ---- scroll geometry: row budgets + windows shared by the wheel/key handlers AND
   //      the render below, so a scroll and its redraw always agree on what fits. ----
   const contentRows = Math.max(1, rows - 1);
-  const mktRows = mktLog.length > 0 ? mktLog.length + 1 : 0;
+  // The marketplace log belongs to the marketplace tabs. It used to render everywhere,
+  // so a rejection picked up on the Experts tab followed you back into the Lounge and sat
+  // over the chat until restart — money/status events are only meaningful next to the
+  // surface that produced them.
+  const showMktLog = mktLog.length > 0 && MARKET_TABS.has(activeTab);
+  const mktRows = showMktLog ? mktLog.length + 1 : 0;
   // Footer chrome = the horizontal rule (1) + the notice line + the input/hint line. The
   // notice can wrap (the long help text is 2 rows on a narrow terminal), so measure it the
   // same way it draws instead of guessing — otherwise a 2-row notice overflows the box and
@@ -984,9 +1107,20 @@ export function App({
     `[${state.self ?? user ?? "guest"}(✓)] ${notice}`,
     Math.max(1, cols),
   );
-  const footerReserve = 1 /* rule */ + noticeRows + 1 /* input/hint */;
-  // Content rows minus header chrome (title + window strip) and the footer, plus any
-  // marketplace log. Mirrors the flex layout below; shared with the scroll windows.
+  // An open autocomplete menu draws BETWEEN the notice and the input, so its rows are
+  // footer chrome too. Without this the transcript keeps its full budget, the column
+  // overflows, and Ink silently drops interior rows to make it fit — messages vanish
+  // mid-scrollback while a menu is open. (`CommandPalette` caps at 8 + an overflow hint;
+  // `mentionMatches` is pre-sliced to 8.)
+  const paletteRows =
+    paletteMatches.length === 0
+      ? 0
+      : Math.min(paletteMatches.length, 8) + (paletteMatches.length > 8 ? 1 : 0);
+  const footerReserve =
+    1 /* rule */ + noticeRows + paletteRows + mentionMatches.length + 1; /* input/hint */
+  // Content rows minus header chrome (title bar + window strip) and the footer, plus any
+  // marketplace log. Mirrors the flex layout below; shared with the scroll windows and
+  // hit-test's BODY_TOP.
   const baseVisible = Math.max(3, contentRows - 2 /* header */ - footerReserve - mktRows);
   // Sidebar ~22% of width (clamped); the chat column gets the rest, minus a 1-col margin.
   const sidebarWidth = Math.min(26, Math.max(14, Math.floor(cols * 0.22)));
@@ -1004,6 +1138,162 @@ export function App({
   const loungeProbe = windowByRows(state.lines, baseVisible, loungeRaw, loungeRowsOf);
   const loungeVisibleRows = Math.max(3, baseVisible - (loungeProbe.hiddenBelow > 0 ? 1 : 0));
   const loungeWin = windowByRows(state.lines, loungeVisibleRows, loungeRaw, loungeRowsOf);
+
+  // Roster sidebar. It used to be a static top-slice (it wasn't selectable, and members
+  // reorder as presence changes) — with Ctrl+U focus it has to scroll to follow the
+  // highlight, so it windows like the list tabs. The selection is stored as a handle and
+  // resolved to an index HERE, every render: if that person left, fall back to row 0.
+  const rosterMembers = state.members;
+  const rosterSel = Math.max(
+    0,
+    rosterMembers.findIndex((m) => m.user === rosterSelUser),
+  );
+  const rosterFocused = activeTab === "lounge" && loungeFocus === "roster";
+  // The selected member's action menu (DM / tag / call), built per-person: you can't DM
+  // yourself, and Call only exists for someone the marketplace lists as an online expert.
+  const rosterMenuUser = rosterMembers[rosterSel]?.user ?? null;
+  const rosterMenuExpert = rosterMenuUser
+    ? (experts.find((e) => e.user === rosterMenuUser) ?? null)
+    : null;
+  const rosterMenuItems: RosterMenuItem[] = useMemo(() => {
+    if (!rosterMenuUser) return [];
+    const items: RosterMenuItem[] = [];
+    if (rosterMenuUser !== who) items.push({ kind: "dm", label: "Send DM" });
+    items.push({ kind: "tag", label: `Tag in #${state.room}` });
+    if (rosterMenuExpert && rosterMenuUser !== who) {
+      // Labels stay short: the sidebar is ~14–26 cells, and a label that wrapped would
+      // eat a second row out of the budget these items are counted against.
+      items.push(
+        rosterMenuExpert.online
+          ? { kind: "call", label: `Call $${rosterMenuExpert.rate}/min` }
+          : // Same fallback the Experts tab gives for an offline expert: the async board.
+            { kind: "bounty", label: "Post a bounty" },
+      );
+    }
+    return items;
+  }, [rosterMenuUser, rosterMenuExpert, who, state.room]);
+  const rosterMenuIdx = rosterMenuItems.length
+    ? Math.min(rosterMenuSel, rosterMenuItems.length - 1)
+    : 0;
+  // Row budget: the `#ROOM · N` header, the menu when it's open, and a `+N more` line
+  // when the list overflows all come out of the sidebar's share of `baseVisible`, so the
+  // column can never draw past the box. The window then follows the highlight.
+  const rosterMenuRows = rosterMenuOpen ? rosterMenuItems.length : 0;
+  const rosterCap = Math.max(1, baseVisible - 1 /* header */ - rosterMenuRows);
+  const rosterRows = Math.max(
+    1,
+    rosterMembers.length > rosterCap ? rosterCap - 1 /* "+N more" */ : rosterCap,
+  );
+  // Modal geometry, computed HERE (not inside the component) because the click hit-tester
+  // needs the same numbers: Ink has no absolute positioning, so the box is placed with an
+  // explicit margin and its absolute rows are derived from that margin.
+  const rosterMenuBox: RosterMenuBox | null = (() => {
+    if (!rosterMenuOpen || rosterMenuItems.length === 0 || !rosterMenuUser) return null;
+    const hint = "↑↓ choose · Enter run · Esc cancel";
+    const inner = Math.max(
+      rosterMenuUser.length + 4 /* "─ name ─" */,
+      hint.length,
+      ...rosterMenuItems.map((i) => i.label.length + 2 /* "› " */),
+    );
+    const width = Math.min(loungeColW, inner + 4 /* borders + padding */);
+    const height = rosterMenuItems.length + 5; /* borders + title + rule + hint */
+    const marginTop = Math.max(0, Math.floor((baseVisible - height) / 2));
+    const marginLeft = Math.max(0, Math.floor((loungeColW - width) / 2));
+    return {
+      marginTop,
+      marginLeft,
+      width,
+      hint,
+      // Absolute 1-based cells for hit-testing: the first item sits below the top border
+      // and the title row; items are the only clickable rows.
+      itemTop: BODY_TOP + marginTop + 2,
+      itemLeft: 1 + marginLeft + 1,
+      itemWidth: Math.max(1, width - 2),
+    };
+  })();
+
+  const rosterWinRaw = listWindow(rosterMembers.length, rosterRows, rosterSel);
+  // The menu draws under the list, so while it's open scroll the window to END on the
+  // selected member — the items then sit directly beneath the name they act on instead
+  // of floating at the bottom of a long roster. (Rows below would otherwise shift under
+  // the menu and desync the click regions.)
+  const rosterWin =
+    rosterMenuOpen && rosterWinRaw.count > 0
+      ? {
+          start: Math.min(
+            Math.max(0, rosterSel - rosterWinRaw.count + 1),
+            Math.max(0, rosterMembers.length - rosterWinRaw.count),
+          ),
+          count: rosterWinRaw.count,
+        }
+      : rosterWinRaw;
+  const rosterHidden = rosterMembers.length - rosterWin.count;
+
+  // Move the roster highlight by whole rows, remembering the HANDLE (not the index).
+  // Resolve off the PREVIOUS handle inside the updater: a held arrow key fires several
+  // keypresses inside one render, and reading `rosterSel` from this closure would make
+  // them all step from the same stale row (they'd collapse into a single move).
+  const moveRoster = (delta: number): void => {
+    if (rosterMembers.length === 0) return;
+    setRosterSelUser((prev) => {
+      const from = Math.max(
+        0,
+        rosterMembers.findIndex((m) => m.user === prev),
+      );
+      const next = Math.min(Math.max(from + delta, 0), rosterMembers.length - 1);
+      return rosterMembers[next]?.user ?? null;
+    });
+  };
+
+  // Focus a roster row by index (a click, or Ctrl+U landing on the first row) and
+  // optionally open its menu — keyboard and mouse share this one path.
+  const focusRosterRow = (index: number, openMenu: boolean): void => {
+    const m = rosterMembers[index];
+    if (!m) return;
+    setLoungeFocus("roster");
+    setRosterSelUser(m.user);
+    setRosterMenuSel(0);
+    setRosterMenuOpen(openMenu);
+    setNotice(
+      openMenu
+        ? `${m.user}: ↑↓ choose · Enter to run · Esc back to the roster`
+        : "Roster: ↑↓ pick someone · Enter for actions · Esc back to chat",
+    );
+  };
+
+  // Run the highlighted menu item. Every branch ends back at the composer — the menu is
+  // a one-shot chooser, not a mode you linger in.
+  const runRosterMenuItem = (item: RosterMenuItem | undefined, peer: string | null): void => {
+    if (!item || !peer) return;
+    closeRosterFocus();
+    if (item.kind === "dm") {
+      openDm(peer);
+      return;
+    }
+    if (item.kind === "tag") {
+      // Drop an `@handle` into the composer and hand typing back — the mention itself is
+      // click/Enter-hittable in the transcript (docs/DMS.md entry point 3).
+      setDraft((d) => (d.endsWith(" ") || d === "" ? `${d}@${peer} ` : `${d} @${peer} `));
+      return;
+    }
+    if (item.kind === "bounty") {
+      setDraft("/bounty ");
+      setNotice(`${peer} is offline — post an async bounty: /bounty <price> <question>.`);
+      return;
+    }
+    // call: reuse the Experts tab's summon-confirm rather than starting a hold from here.
+    const e = experts.find((x) => x.user === peer);
+    if (!e) return;
+    if (!marketplace || !user) {
+      setNotice("Sign in with /login to call an expert.");
+      return;
+    }
+    setActiveTab("experts");
+    setSelection(Math.max(0, experts.indexOf(e)));
+    setSummonExpert(e);
+    setDraft("");
+    setNotice(`Describe your problem, then Enter to authorize the hold for ${e.user}.`);
+  };
 
   // Open DM thread, same wrap-aware windowing over the FULL body width (no sidebar), with
   // tighter header chrome (back row + query line + a wrapping safety-number line).
@@ -1073,6 +1363,21 @@ export function App({
       // Mirror the on-screen list window so a click on a scrolled list maps to the true
       // index, not the screen row (scroll.ts + the body window props must agree).
       ...(activeListWin ? { listStart: activeListWin.start, listCount: activeListWin.count } : {}),
+      // Same deal for the roster sidebar, which windows independently of the body.
+      rosterCount: rosterMembers.length,
+      sidebarWidth,
+      rosterStart: rosterWin.start,
+      rosterVisible: rosterWin.count,
+      ...(rosterMenuBox
+        ? {
+            rosterMenu: {
+              top: rosterMenuBox.itemTop,
+              left: rosterMenuBox.itemLeft,
+              width: rosterMenuBox.itemWidth,
+              count: rosterMenuItems.length,
+            },
+          }
+        : {}),
     });
     const target = hitTest(regions, event.x, event.y);
     if (!target) return;
@@ -1099,6 +1404,12 @@ export function App({
       activate("dms", target.index);
     } else if (target.kind === "dm-back") {
       dmBack();
+    } else if (target.kind === "roster-row") {
+      // Clicking a name = Ctrl+U onto that row + Enter: highlight them and open the menu.
+      focusRosterRow(target.index, true);
+    } else if (target.kind === "roster-menu") {
+      // Clicking a menu row runs it, exactly as Enter on the highlight would.
+      runRosterMenuItem(rosterMenuItems[target.index], rosterMenuUser);
     }
   };
   useMouse(staticInput !== true, handleMouse);
@@ -1140,6 +1451,9 @@ export function App({
           locked: pendingLogin !== null,
           dmView,
           paletteOpen,
+          mentionOpen,
+          loungeFocus,
+          rosterMenuOpen,
         },
         input,
         key,
@@ -1150,6 +1464,33 @@ export function App({
           break;
         case "move-selection":
           setSelection(action.selection);
+          break;
+        case "roster-focus":
+          if (action.focus === "roster") {
+            // Ctrl+U with nothing to select is a no-op rather than a mode you're stuck in.
+            if (rosterMembers.length === 0) break;
+            focusRosterRow(rosterSelUser ? rosterSel : 0, false);
+          } else {
+            closeRosterFocus();
+          }
+          break;
+        case "roster-move":
+          moveRoster(action.delta);
+          break;
+        case "roster-menu-open":
+          if (rosterMenuItems.length > 0) focusRosterRow(rosterSel, true);
+          break;
+        case "roster-menu-move": {
+          const n = rosterMenuItems.length;
+          if (n > 0) setRosterMenuSel((s) => (Math.min(s, n - 1) + action.delta + n) % n); // wrap
+          break;
+        }
+        case "roster-menu-accept":
+          runRosterMenuItem(rosterMenuItems[rosterMenuIdx], rosterMenuUser);
+          break;
+        case "roster-menu-close":
+          // One level only: back to roster focus, menu shut.
+          focusRosterRow(rosterSel, false);
           break;
         case "palette-move": {
           const n = paletteMatches.length;
@@ -1171,6 +1512,26 @@ export function App({
         case "palette-close": // Esc cancels the command entry
           setDraft("");
           setPaletteSel(0);
+          break;
+        case "mention-move": {
+          const n = mentionMatches.length;
+          if (n > 0) setMentionSel((s) => (Math.min(s, n - 1) + action.delta + n) % n); // wrap
+          break;
+        }
+        case "mention-accept": {
+          // Replace the trailing `@partial` with the full handle and a space, leaving the
+          // rest of the sentence untouched — you keep typing where you left off.
+          const pick = mentionMatches[mentionIdx];
+          if (!pick) break;
+          setDraft((d) => `${d.slice(0, d.length - (mentionPrefix(d)?.length ?? 0) - 1)}@${pick} `);
+          setMentionSel(0);
+          break;
+        }
+        case "mention-close":
+          // Esc dismisses the menu WITHOUT touching the draft (unlike the command menu,
+          // where the draft IS the command). Typing another character brings it back.
+          setMentionDismissed(draft);
+          setMentionSel(0);
           break;
         case "submit":
           setDraft("");
@@ -1202,11 +1563,14 @@ export function App({
   // Blink the input cursor only when a text input is actually focused (Lounge, an open
   // DM thread, or the summon-confirm `[problem]` field).
   const cursorOn = useBlink(
-    staticInput !== true && (activeTab === "lounge" || activeTab === "dms" || summonExpert != null),
+    staticInput !== true &&
+      // While the roster has the keyboard the composer isn't listening — parking the
+      // cursor says so, instead of blinking at keys that go somewhere else.
+      !rosterFocused &&
+      (activeTab === "lounge" || activeTab === "dms" || summonExpert != null),
   );
 
   // Presence + meter readouts for the two olive status bars (design 2a).
-  const onlineCount = state.members.length + state.guests;
   const onlineExperts = useMemo(() => experts.filter((e) => e.online), [experts]);
   const minExpertRate = onlineExperts.length ? Math.min(...onlineExperts.map((e) => e.rate)) : null;
   // In-call meter shows peer + elapsed time only — no running dollar. This surface
@@ -1214,9 +1578,12 @@ export function App({
   // browser call page + Session DO stay the money authorities.
   const meterClock = clock(callSecs);
   // `[nick(✓)]` shown on the notice row — the effective (display) name after /nick.
-  const selfTag = user
-    ? `${state.self ?? user}(✓)`
-    : (state.self ?? (state.connected ? "guest" : "connecting…"));
+  // The ✓ follows the SERVER's verdict, not our saved credentials: a stale token used to
+  // render a guest name with a tick beside it, which is the opposite of informative.
+  const selfTag =
+    user && state.verified
+      ? `${state.self ?? user}(✓)`
+      : (state.self ?? user ?? (state.connected ? "guest" : "connecting…"));
 
   // The input line context (design 2a): lime `[#general]` in the lounge, `[mira]` in a
   // DM query, `[problem]` while confirming a summon, `code` while pasting a login code.
@@ -1266,10 +1633,12 @@ export function App({
   // width so the bar never overflows and wraps (`cellWidth`).
   const topRight = call
     ? `${G.summon} ${call.peer} ${meterClock} [end] `
-    : `${G.online} ${onlineCount} online${minExpertRate != null ? `  ${G.summon} ${onlineExperts.length} experts from $${minExpertRate}/min` : ""} `;
-  const topPad = " ".repeat(
-    Math.max(1, cols - 16 /* " ▄▀ termchat " + "0.5" */ - cellWidth(topRight)),
-  );
+    : minExpertRate != null
+      ? `${G.summon} ${onlineExperts.length} experts from $${minExpertRate}/min `
+      : "";
+  // Left side is ` ▄▀ termchat ` (13 cells) plus the version, which is no longer a fixed
+  // width — measure it rather than baking a constant that a release would falsify.
+  const topPad = " ".repeat(Math.max(1, cols - (13 + VERSION_LABEL.length) - cellWidth(topRight)));
   const winCells = windowStripCells(activeTab, dmUnread);
   const winLeftW = winCells.reduce((n, c) => n + c.text.length, 0);
   const winRight = call ? `${G.summon} ${meterClock} ` : "";
@@ -1307,7 +1676,7 @@ export function App({
 
   return (
     <Box flexDirection="column" width={cols} height={contentRows}>
-      {/* ── top olive bar: ▄▀ brand mark + presence, or the in-call meter + [end] ── */}
+      {/* ── top olive bar: ▄▀ brand mark, or the in-call meter + [end] ── */}
       <Box>
         <Text backgroundColor={C.barBg}> </Text>
         <Text backgroundColor={C.barBg} color={C.accent} bold>
@@ -1320,7 +1689,7 @@ export function App({
           {" termchat "}
         </Text>
         <Text backgroundColor={C.barBg} color={C.barFg} dimColor>
-          0.5
+          {VERSION_LABEL}
         </Text>
         <Text backgroundColor={C.barBg}>{topPad}</Text>
         {call ? (
@@ -1334,21 +1703,15 @@ export function App({
             <Text backgroundColor={C.barBg}> </Text>
           </>
         ) : (
-          <>
-            <Text backgroundColor={C.barBg} color={C.accent}>
-              {`${G.online} ${onlineCount} online`}
+          minExpertRate != null && (
+            <Text backgroundColor={C.barBg} color={C.amber}>
+              {`${G.summon} ${onlineExperts.length} experts from $${minExpertRate}/min `}
             </Text>
-            {minExpertRate != null && (
-              <Text backgroundColor={C.barBg} color={C.amber}>
-                {`  ${G.summon} ${onlineExperts.length} experts from $${minExpertRate}/min`}
-              </Text>
-            )}
-            <Text backgroundColor={C.barBg}> </Text>
-          </>
+          )
         )}
       </Box>
 
-      {/* ── window bar: numbered irssi windows (click / Tab). Darker than the presence
+      {/* ── window bar: irssi-style windows (click / Tab). Darker than the presence
              bar above so the two rows read as separate lines. In-call meter on the right. ── */}
       <Box>
         {winCells.map((cell) => (
@@ -1373,8 +1736,26 @@ export function App({
           {/* justifyContent flex-end keeps the newest message hugging the divider/input
               (chat-app style); any slack from a short transcript falls at the TOP, not as
               a gap above the input. */}
-          <Box flexDirection="column" flexGrow={1} marginRight={1} justifyContent="flex-end">
-            {shown.length === 0 ? (
+          <Box
+            flexDirection="column"
+            flexGrow={1}
+            marginRight={1}
+            // The modal is placed by an explicit marginTop (so hit-test can mirror its
+            // rows), which only works from the top; the transcript still hugs the bottom.
+            justifyContent={rosterMenuBox ? "flex-start" : "flex-end"}
+          >
+            {rosterMenuBox ? (
+              // The roster action menu is a real modal: it takes over the chat column
+              // rather than trailing off the bottom of the sidebar, where it read as
+              // detached from the name it acts on. The roster keeps its highlight, so
+              // "who is this for" is answered in two places at once.
+              <RosterMenuModal
+                user={rosterMenuUser ?? ""}
+                items={rosterMenuItems}
+                sel={rosterMenuIdx}
+                box={rosterMenuBox}
+              />
+            ) : shown.length === 0 ? (
               <Text color={C.muted2}>No messages yet. Say hi!</Text>
             ) : (
               shown.map((line) => <ChatRow key={line.id} line={line} self={who} />)
@@ -1382,7 +1763,7 @@ export function App({
             {/* scrolled-up marker: only shows when there ARE newer lines below the fold,
                 which only happens once the log overflows — so it always lands on the
                 bottom row of a full window (its row is reserved out of `loungeVisible`). */}
-            {loungeWin.hiddenBelow > 0 && (
+            {!rosterMenuBox && loungeWin.hiddenBelow > 0 && (
               <Text
                 color={C.muted2}
               >{`▾ ${loungeWin.hiddenBelow} newer — PgDn / ↓ · Esc for latest`}</Text>
@@ -1398,37 +1779,37 @@ export function App({
             borderBottom={false}
           >
             <Text color={C.muted}>{` #${state.room.toUpperCase()} · ${state.members.length}`}</Text>
-            {state.members.length === 0 ? (
+            {rosterMembers.length === 0 ? (
               <Text color={C.muted2}> — quiet —</Text>
             ) : (
-              (() => {
-                // The roster isn't selectable, so it can't "scroll to follow" anything —
-                // window it to the rows that fit and note the overflow. Members reorder as
-                // presence changes, so a static "+N more" is steadier than a wheel offset.
-                const cap = Math.max(1, baseVisible - 1 /* the "#ROOM · N" header */);
-                const overflow = state.members.length > cap;
-                const membersShown = overflow ? state.members.slice(0, cap - 1) : state.members;
-                const hidden = state.members.length - membersShown.length;
-                return (
-                  <>
-                    {membersShown.map((m) => {
-                      const isSelf = m.user === who;
-                      return (
-                        <Text key={m.user}>
-                          <Text color={m.verified ? C.accent : C.muted}>
-                            {m.verified ? ` ${G.online}` : ` ${G.offline}`}
-                          </Text>
-                          <Text {...nickProps(m.user, isSelf)}>{` ${m.user}`}</Text>
-                          <Text
-                            color={C.muted2}
-                          >{`${m.verified ? " ✓" : ""}${m.topic ? ` ${m.topic}` : ""}`}</Text>
+              <>
+                {rosterMembers
+                  .slice(rosterWin.start, rosterWin.start + rosterWin.count)
+                  .map((m, j) => {
+                    const isSelf = m.user === who;
+                    // Only paint the highlight while the roster actually HAS the keyboard —
+                    // otherwise it reads as a selection that arrow keys refuse to move.
+                    const on = rosterFocused && rosterWin.start + j === rosterSel;
+                    return (
+                      <Text
+                        key={m.user}
+                        wrap="truncate"
+                        {...(on ? { backgroundColor: C.rowHighlight } : {})}
+                      >
+                        <Text color={on ? C.rowHighlightFg : m.verified ? C.accent : C.muted}>
+                          {m.verified ? ` ${G.online}` : ` ${G.offline}`}
                         </Text>
-                      );
-                    })}
-                    {hidden > 0 && <Text color={C.muted2}>{` +${hidden} more`}</Text>}
-                  </>
-                );
-              })()
+                        <Text
+                          {...(on ? { color: C.rowHighlightFg, bold: true } : nickProps(isSelf))}
+                        >{` ${m.user}`}</Text>
+                        <Text color={on ? C.rowHighlightFg : C.muted2}>
+                          {`${m.verified ? " ✓" : ""}${m.topic ? ` ${m.topic}` : ""}`}
+                        </Text>
+                      </Text>
+                    );
+                  })}
+                {rosterHidden > 0 && <Text color={C.muted2}>{` +${rosterHidden} more`}</Text>}
+              </>
             )}
             <Box flexGrow={1} />
           </Box>
@@ -1491,7 +1872,7 @@ export function App({
       )}
 
       {/* marketplace event log (only when active) — `-⚡-` money events in amber */}
-      {mktLog.length > 0 && (
+      {showMktLog && (
         <Box flexDirection="column">
           {mktLog.map((line, i) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: append-only capped log
@@ -1519,6 +1900,10 @@ export function App({
       {/* `/` command menu (Claude-Code style): filtered list above the input, ↑↓ + Tab/Enter */}
       <CommandPalette matches={paletteMatches} sel={palSel} />
 
+      {/* `@` mention menu: who's in the room, filtered as you type. Tab completes (Enter
+          still sends — a mention is mid-sentence, not the whole message). */}
+      <MentionMenu matches={mentionMatches} sel={mentionIdx} />
+
       {/* input line: lime context prompt + draft + blinking block cursor, or nav hint */}
       {summonExpert ? (
         <Text color={C.muted2}> Enter authorize the hold · Esc cancel</Text>
@@ -1531,6 +1916,100 @@ export function App({
       ) : (
         <Text color={C.muted2}>{navHint}</Text>
       )}
+    </Box>
+  );
+}
+
+/** Where the roster action modal sits, in cells. The App computes this so the renderer
+ *  and the click hit-tester place the box from the SAME numbers (Ink has no absolute
+ *  positioning — the margins below are what actually put it on screen). */
+export interface RosterMenuBox {
+  marginTop: number;
+  marginLeft: number;
+  width: number;
+  hint: string;
+  /** 1-based absolute row of the first clickable item, and its x/width. */
+  itemTop: number;
+  itemLeft: number;
+  itemWidth: number;
+}
+
+/** The roster member's action menu, as a bordered modal over the chat column: a titled
+ *  box with one row per action and the keys along the bottom. It replaces the transcript
+ *  while open — the earlier sidebar version trailed off the end of the member list, which
+ *  read as unrelated to the name it acted on. */
+export function RosterMenuModal({
+  user,
+  items,
+  sel,
+  box,
+}: {
+  user: string;
+  items: readonly RosterMenuItem[];
+  sel: number;
+  box: RosterMenuBox;
+}): React.ReactElement {
+  const inner = Math.max(1, box.width - 4); // borders + paddingX
+  return (
+    <Box marginTop={box.marginTop} marginLeft={box.marginLeft}>
+      <Box
+        flexDirection="column"
+        width={box.width}
+        borderStyle="round"
+        borderColor={C.line2}
+        paddingX={1}
+      >
+        <Text color={C.fgBright} bold wrap="truncate">
+          {user}
+        </Text>
+        {items.map((item, i) => {
+          const on = i === sel;
+          // Pad to the inner width so the selected row's block spans the whole box —
+          // a highlight that stops at the end of the label looks like a rendering slip.
+          const label = `${on ? "›" : " "} ${item.label}`.padEnd(inner);
+          return (
+            <Text
+              key={item.kind}
+              wrap="truncate"
+              {...(on ? { backgroundColor: C.rowHighlight } : {})}
+              color={on ? C.rowHighlightFg : item.kind === "call" ? C.amber : C.fg}
+              bold={on}
+            >
+              {label}
+            </Text>
+          );
+        })}
+        <Text color={C.line2}>{"─".repeat(inner)}</Text>
+        <Text color={C.muted2} wrap="truncate">
+          {box.hint}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
+/** The `@` mention autocomplete menu: room members matching the handle being typed.
+ *  Deliberately plainer than the command palette — it's a list of names, and the footer
+ *  spells out the one key that isn't obvious (Tab completes, Enter still sends). */
+export function MentionMenu({
+  matches,
+  sel,
+}: {
+  matches: readonly string[];
+  sel: number;
+}): React.ReactElement | null {
+  if (matches.length === 0) return null;
+  return (
+    <Box flexDirection="column">
+      {matches.map((user, i) => {
+        const on = i === sel;
+        return (
+          <Text key={user} {...(on ? { backgroundColor: C.rowHighlight } : {})}>
+            <Text color={selFg(on, C.nick)} bold={on}>{` @${user.padEnd(16)} `}</Text>
+            <Text color={selFg(on, C.muted2)}>{on ? "Tab to complete · Enter sends" : ""}</Text>
+          </Text>
+        );
+      })}
     </Box>
   );
 }
@@ -1623,7 +2102,7 @@ export function ExpertsBody({
               <Text color={selFg(active, e.online ? C.accent : C.muted)}>
                 {e.online ? ` ${G.online}` : ` ${G.offline}`}
               </Text>
-              <Text color={selFg(active, nickColor(e.user))} bold>{` ${e.user}`}</Text>
+              <Text color={selFg(active, C.nick)} bold>{` ${e.user}`}</Text>
               <Text color={selFg(active, C.accent)} bold={active}>
                 {e.topExpert ? ` ${G.verified}${G.topExpert}` : ` ${G.verified}`}
               </Text>
@@ -1677,7 +2156,7 @@ export function SummonConfirmBody({
       <Text> </Text>
       <Text>
         <Text color={C.muted2}>{" expert     "}</Text>
-        <Text color={nickColor(expert.user)} bold>
+        <Text color={C.nick} bold>
           {expert.user}
         </Text>
         <Text color={C.accent}>
@@ -1858,7 +2337,7 @@ export function CallsBody({
           <Text key={s.sessionId} {...(active_ ? { backgroundColor: C.rowHighlight } : {})}>
             <Text color={selFg(active_, C.accent)}>{active_ ? "›" : " "}</Text>
             <Text color={selFg(active_, C.fg)} bold={active_}>{` #${s.sessionId}`}</Text>
-            <Text color={selFg(active_, nickColor(s.peer))} bold={active_}>{` ${s.peer}`}</Text>
+            <Text color={selFg(active_, C.nick)} bold={active_}>{` ${s.peer}`}</Text>
             <Text color={selFg(active_, C.muted)} bold={active_}>{`  ${s.minutes}min`}</Text>
             <Text color={selFg(active_, C.amber)} bold={active_}>{`  ${usd(s.amountCents)}`}</Text>
             <Text
@@ -2013,7 +2492,7 @@ export function DmsBody({
         </Text>
         <Text>
           <Text color={C.muted2}>{" -!- query with "}</Text>
-          <Text {...nickProps(name, false)}>{`@${name}`}</Text>
+          <Text {...nickProps(false)}>{`@${name}`}</Text>
           <Text color={C.accent}>{` ${G.verified}`}</Text>
         </Text>
         <DmHeader keyStatus={dm?.keyStatus ?? null} safetyWords={dm?.safetyWords ?? []} />
@@ -2026,7 +2505,7 @@ export function DmsBody({
             // color on the parent so a wrapped message keeps its color on rows 2+ (see ChatRow).
             <Text key={l.id} color={C.fg} {...(l.pending ? { dimColor: true } : {})}>
               <Text color={C.muted}>{" <"}</Text>
-              <Text {...nickProps(senderLabel(l.from), isMine(l.from))}>{senderLabel(l.from)}</Text>
+              <Text {...nickProps(isMine(l.from))}>{senderLabel(l.from)}</Text>
               <Text color={C.muted}>{"> "}</Text>
               <Text color={C.fg}>
                 {l.undecryptable ? "[can't decrypt]" : `${l.text}${l.pending ? " …" : ""}`}
@@ -2069,7 +2548,7 @@ export function DmsBody({
             <Text color={selFg(on, t.unread > 0 ? C.accent : C.muted2)}>
               {t.unread > 0 ? ` ${G.online}` : "  "}
             </Text>
-            <Text color={selFg(on, nickColor(name))} bold={on}>{` @${name}`}</Text>
+            <Text color={selFg(on, C.nick)} bold={on}>{` @${name}`}</Text>
             <Text color={selFg(on, C.muted2)} bold={on}>{`  ${timeAgo(t.lastTs, now)}`}</Text>
           </Text>
         );
@@ -2131,7 +2610,7 @@ function ChatRow({ line, self }: { line: ChatLine; self: string | null }): React
     <Text color={C.fg}>
       <Text color={C.muted2}>{`${time} `}</Text>
       <Text color={C.muted}>{"<"}</Text>
-      <Text {...nickProps(line.from ?? "", isSelf)}>{line.from}</Text>
+      <Text {...nickProps(isSelf)}>{line.from}</Text>
       <Text color={C.muted}>{"> "}</Text>
       <Text color={C.fg}>{line.text}</Text>
     </Text>

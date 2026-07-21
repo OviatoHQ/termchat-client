@@ -5,10 +5,13 @@ import {
   CALLS_LIST_OFFSET,
   DMS_INBOX_OFFSET,
   EXPERTS_LIST_OFFSET,
+  ROSTER_LIST_OFFSET,
   TAB_ROW,
   bodyRegions,
   hitTest,
   regionsForView,
+  rosterMenuRegions,
+  rosterRegions,
   tabRegions,
 } from "../src/tui/hit-test.ts";
 
@@ -26,7 +29,7 @@ const view = (over: Partial<Parameters<typeof bodyRegions>[0]>) => ({
   ...over,
 });
 
-test("tabRegions lays the six numbered windows left-to-right on the strip", () => {
+test("tabRegions lays the six windows left-to-right on the strip", () => {
   const regions = tabRegions("lounge", 0);
   expect(regions.map((r) => r.target)).toEqual([
     { kind: "tab", tab: "lounge" },
@@ -36,10 +39,10 @@ test("tabRegions lays the six numbered windows left-to-right on the strip", () =
     { kind: "tab", tab: "calls" },
     { kind: "tab", tab: "me" },
   ]);
-  // `[1:lounge]` (10) at x=1; ` 2:dms ` (7) at x=11; ` 3:experts ` (11) at x=18.
-  expect(regions[0]).toMatchObject({ x: 1, y: TAB_ROW, w: 10 });
-  expect(regions[1]).toMatchObject({ x: 11, y: TAB_ROW, w: 7 });
-  expect(regions[2]).toMatchObject({ x: 18, y: TAB_ROW, w: 11 });
+  // `[LOUNGE]` (8) at x=1; ` DMS ` (5) at x=9; ` EXPERTS ` (9) at x=14.
+  expect(regions[0]).toMatchObject({ x: 1, y: TAB_ROW, w: 8 });
+  expect(regions[1]).toMatchObject({ x: 9, y: TAB_ROW, w: 5 });
+  expect(regions[2]).toMatchObject({ x: 14, y: TAB_ROW, w: 9 });
   // Tabs are contiguous, no gaps.
   for (let i = 1; i < regions.length; i++) {
     expect(regions[i]?.x).toBe((regions[i - 1]?.x ?? 0) + (regions[i - 1]?.w ?? 0));
@@ -48,7 +51,7 @@ test("tabRegions lays the six numbered windows left-to-right on the strip", () =
 
 test("the DMs unread badge widens its cell and shifts the ones after it", () => {
   const plain = tabRegions("lounge", 0);
-  const badged = tabRegions("lounge", 2); // ` 2:dms(2!) ` is 4 cells wider
+  const badged = tabRegions("lounge", 2); // ` DMS(2!) ` is 4 cells wider
   expect(badged[1]?.w).toBe((plain[1]?.w ?? 0) + 4);
   expect(badged[2]?.x).toBe((plain[2]?.x ?? 0) + 4);
 });
@@ -56,10 +59,10 @@ test("the DMs unread badge widens its cell and shifts the ones after it", () => 
 test("clicking the window strip routes to the right window", () => {
   const regions = tabRegions("lounge", 0);
   expect(hitTest(regions, 1, TAB_ROW)).toEqual({ kind: "tab", tab: "lounge" });
-  expect(hitTest(regions, 11, TAB_ROW)).toEqual({ kind: "tab", tab: "dms" });
-  expect(hitTest(regions, 18, TAB_ROW)).toEqual({ kind: "tab", tab: "experts" });
-  expect(hitTest(regions, 29, TAB_ROW)).toEqual({ kind: "tab", tab: "bounties" });
-  expect(hitTest(regions, 50, TAB_ROW)).toEqual({ kind: "tab", tab: "me" });
+  expect(hitTest(regions, 9, TAB_ROW)).toEqual({ kind: "tab", tab: "dms" });
+  expect(hitTest(regions, 14, TAB_ROW)).toEqual({ kind: "tab", tab: "experts" });
+  expect(hitTest(regions, 23, TAB_ROW)).toEqual({ kind: "tab", tab: "bounties" });
+  expect(hitTest(regions, 40, TAB_ROW)).toEqual({ kind: "tab", tab: "me" });
 });
 
 test("a click off the window strip (wrong y) misses every window", () => {
@@ -205,4 +208,74 @@ test("un-windowed lists (no listCount) still render every row — backward compa
     kind: "expert",
     index: 0,
   });
+});
+
+// ---- the Lounge roster sidebar (the one non-full-width target) ----
+
+test("roster rows sit in the right sidebar, below the #ROOM header", () => {
+  const regions = rosterRegions(view({ cols: 80, rosterCount: 3, sidebarWidth: 20 }));
+  expect(regions).toHaveLength(3);
+  // x = cols − sidebarWidth + 1 = 61, and each row is exactly the sidebar's width.
+  expect(regions[0]).toMatchObject({
+    x: 61,
+    y: BODY_TOP + ROSTER_LIST_OFFSET,
+    w: 20,
+    target: { kind: "roster-row", index: 0 },
+  });
+  expect(hitTest(regions, 61, BODY_TOP + ROSTER_LIST_OFFSET + 2)).toEqual({
+    kind: "roster-row",
+    index: 2,
+  });
+});
+
+test("a click left of the sidebar (in the transcript) misses every roster row", () => {
+  const regions = rosterRegions(view({ cols: 80, rosterCount: 3, sidebarWidth: 20 }));
+  expect(hitTest(regions, 60, BODY_TOP + ROSTER_LIST_OFFSET)).toBeUndefined();
+  // ...and so does the `#ROOM · N` header row itself.
+  expect(hitTest(regions, 70, BODY_TOP)).toBeUndefined();
+});
+
+test("a scrolled roster maps the top drawn row to `rosterStart`, not 0", () => {
+  const regions = rosterRegions(
+    view({ cols: 80, rosterCount: 40, sidebarWidth: 20, rosterStart: 12, rosterVisible: 5 }),
+  );
+  expect(regions).toHaveLength(5);
+  expect(hitTest(regions, 65, BODY_TOP + ROSTER_LIST_OFFSET)).toEqual({
+    kind: "roster-row",
+    index: 12,
+  });
+  expect(hitTest(regions, 65, BODY_TOP + ROSTER_LIST_OFFSET + 4)).toEqual({
+    kind: "roster-row",
+    index: 16,
+  });
+  expect(hitTest(regions, 65, BODY_TOP + ROSTER_LIST_OFFSET + 5)).toBeUndefined();
+});
+
+test("the roster is Lounge-only and empty rosters have no targets", () => {
+  expect(
+    rosterRegions(view({ activeTab: "experts", rosterCount: 3, sidebarWidth: 20 })),
+  ).toHaveLength(0);
+  expect(rosterRegions(view({ rosterCount: 0, sidebarWidth: 20 }))).toHaveLength(0);
+  // regionsForView folds the roster in alongside the tab strip.
+  expect(regionsForView(view({ rosterCount: 3, sidebarWidth: 20 }))).toHaveLength(6 + 3);
+});
+
+test("the action modal's item rows are clickable where the App placed the box", () => {
+  // The modal floats over the chat column, so its rows come from explicit geometry
+  // rather than the sidebar's — a click inside the sidebar at the same y must miss.
+  const menu = { top: 10, left: 20, width: 30, count: 3 };
+  const regions = rosterMenuRegions(view({ cols: 80, sidebarWidth: 20, rosterMenu: menu }));
+  expect(regions).toHaveLength(3);
+  expect(regions[0]).toMatchObject({
+    x: 20,
+    y: 10,
+    w: 30,
+    target: { kind: "roster-menu", index: 0 },
+  });
+  expect(hitTest(regions, 25, 12)).toEqual({ kind: "roster-menu", index: 2 });
+  expect(hitTest(regions, 25, 13)).toBeUndefined(); // past the last item (the hint row)
+  expect(hitTest(regions, 19, 10)).toBeUndefined(); // left of the box (the border)
+  // No menu open, or another tab: nothing to click.
+  expect(rosterMenuRegions(view({ cols: 80 }))).toHaveLength(0);
+  expect(rosterMenuRegions(view({ activeTab: "me", rosterMenu: menu }))).toHaveLength(0);
 });
