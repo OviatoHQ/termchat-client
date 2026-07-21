@@ -5,4 +5,10 @@ monorepo's release flow; versions map 1:1 to `v*` tags on this repo.
 
 ## v0.1.0 — 2026-07-21
 
-- Initial published release of the termchat client.
+The first published release of the termchat client — the open-source terminal
+client for [termchat](https://termchat.sh): a Bun-powered TUI, a presence daemon,
+and the agent hooks that wire termchat into Claude Code and Codex.
+
+Your prompts, `cwd`, file paths, and transcripts never leave your machine — the
+client derives a coarse topic locally and sends only that. This repo is open so
+you can verify that.
