@@ -190,3 +190,101 @@ test("thread: display names label messages; the raw handle is never surfaced", (
   expect(frame).toContain("<me> yo"); // my own message stays "me"
   expect(frame).not.toContain("shafiu"); // the raw handle is never surfaced
 });
+
+test("thread: an offset scrolls the transcript up and flags newer messages below", () => {
+  const lines = Array.from({ length: 20 }, (_, i) => ({
+    id: i + 1,
+    from: "bob",
+    text: `msg-${i + 1}`,
+    ts: i + 1,
+  }));
+  const dm: DmControllerState = {
+    ...base,
+    activePeer: "bob",
+    activeLabel: "bob",
+    active: { peer: "bob", connected: true, self: "alice", lines },
+    safetyWords: [],
+    keyStatus: "pinned",
+  };
+  // maxLines 5, scrolled up 3 rows → the bottom-of-window is msg-17, msgs 18..20 hidden.
+  const { lastFrame } = render(
+    <DmsBody dm={dm} sel={0} signedIn dmView="thread" now={NOW} maxLines={5} offset={3} />,
+  );
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("msg-13"); // window is msg-13..17
+  expect(frame).toContain("msg-17");
+  expect(frame).not.toContain("msg-18"); // newer, below the fold
+  expect(frame).toContain("▾ 3 newer"); // the scrolled-up hint
+});
+
+test("inbox: a long inbox windows to follow the selection", () => {
+  const threads = Array.from({ length: 15 }, (_, i) => ({
+    peer: `peer${String(i).padStart(2, "0")}`,
+    lastId: i,
+    lastTs: NOW - i * 1000,
+    unread: 0,
+  }));
+  const dm: DmControllerState = { ...base, threads };
+  // Rows: index 0 = new-DM, index i≥1 = threads[i-1]. Window start 8, count 4, sel 9.
+  const { lastFrame } = render(
+    <DmsBody dm={dm} sel={9} signedIn dmView="inbox" now={NOW} start={8} count={4} />,
+  );
+  const frame = lastFrame() ?? "";
+  expect(frame).not.toContain("Send new DM"); // row 0 is above the fold now
+  expect(frame).toContain("@peer08"); // thread index 9 → threads[8]
+  expect(frame.split("\n").find((l) => l.includes("@peer08"))).toContain("›"); // selected
+});
+
+test("thread: a scrolled thread with a full 16-word safety number stays within budget", () => {
+  // Regression: the "▾ N newer" hint must be reserved from the window height, not added
+  // on top — a wrapping 16-word safety line already makes the header 2 rows at 80 cols,
+  // so an un-reserved hint would push the body one row over and flicker the input line.
+  const lines = Array.from({ length: 30 }, (_, i) => ({
+    id: i + 1,
+    from: "bob",
+    text: `msg-${i + 1}`,
+    ts: i + 1,
+  }));
+  const words = [
+    "anchor",
+    "ribbon",
+    "maple",
+    "velvet",
+    "cedar",
+    "harbor",
+    "quartz",
+    "willow",
+    "copper",
+    "meadow",
+    "falcon",
+    "pebble",
+    "cobalt",
+    "juniper",
+    "lantern",
+    "marble",
+  ];
+  const dm: DmControllerState = {
+    ...base,
+    activePeer: "bob",
+    activeLabel: "bob",
+    active: { peer: "bob", connected: true, self: "alice", lines },
+    safetyWords: words,
+    keyStatus: "pinned",
+  };
+  // The App passes maxLines already reduced by one when scrolled (offset>0); mirror that:
+  // an un-scrolled thread fits `maxLines` message rows, a scrolled one fits `maxLines - 1`
+  // plus the hint — so both render the SAME number of body rows.
+  const MAX = 8;
+  const pinned =
+    render(
+      <DmsBody dm={dm} sel={0} signedIn dmView="thread" now={NOW} maxLines={MAX} offset={0} />,
+    ).lastFrame() ?? "";
+  const scrolled =
+    render(
+      <DmsBody dm={dm} sel={0} signedIn dmView="thread" now={NOW} maxLines={MAX - 1} offset={4} />,
+    ).lastFrame() ?? "";
+  // A scrolled thread must not be taller than the pinned one (the reserved-row invariant).
+  expect(scrolled.split("\n").length).toBeLessThanOrEqual(pinned.split("\n").length);
+  expect(scrolled).toContain("▾ 4 newer"); // the hint is present…
+  expect(scrolled).toContain("marble"); // …and the full safety number still renders
+});

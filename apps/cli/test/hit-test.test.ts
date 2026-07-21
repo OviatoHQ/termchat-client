@@ -4,6 +4,7 @@ import {
   BOUNTIES_LIST_OFFSET,
   CALLS_LIST_OFFSET,
   DMS_INBOX_OFFSET,
+  EXPERTS_LIST_OFFSET,
   TAB_ROW,
   bodyRegions,
   hitTest,
@@ -160,4 +161,48 @@ test("Lounge and Calls have no body click targets (only the tab strip)", () => {
   expect(bodyRegions(view({ activeTab: "calls", expertsCount: 5, meCount: 4 }))).toHaveLength(0);
   // regionsForView still includes the (six) tab strip cells so tabs stay clickable.
   expect(regionsForView(view({ activeTab: "lounge" }))).toHaveLength(6);
+});
+
+// ---- scrolled list windowing (scroll.ts follows the selection; hit-test must agree) ----
+
+test("windowed list: a click on the first on-screen row resolves to `listStart`, not 0", () => {
+  // 20 experts, only 6 on screen starting at index 12 (the list scrolled to follow sel).
+  const v = view({ activeTab: "experts", expertsCount: 20, listStart: 12, listCount: 6 });
+  const regions = bodyRegions(v);
+  // Exactly the windowed rows are clickable — no more than fit.
+  expect(regions).toHaveLength(6);
+  // The top drawn row (BODY_TOP + EXPERTS_LIST_OFFSET) maps to item 12, not 0.
+  const top = hitTest(regions, 1, BODY_TOP + EXPERTS_LIST_OFFSET);
+  expect(top).toEqual({ kind: "expert", index: 12 });
+  // The last drawn row maps to item 17 (12 + 6 - 1).
+  const bottom = hitTest(regions, 1, BODY_TOP + EXPERTS_LIST_OFFSET + 5);
+  expect(bottom).toEqual({ kind: "expert", index: 17 });
+});
+
+test("windowed bounties scrolled to the bottom still show + route the post row", () => {
+  // 10 bounties + the post row = 11 selectable rows; a 4-row window scrolled to the end.
+  const v = view({
+    activeTab: "bounties",
+    bountiesCount: 10,
+    listStart: 7, // rows 7..10 → bounties 7,8,9 then the post row (index 10)
+    listCount: 4,
+  });
+  const regions = bodyRegions(v);
+  expect(regions).toHaveLength(4);
+  // The last visible bounty (index 9) sits third in the window.
+  expect(hitTest(regions, 1, BODY_TOP + BOUNTIES_LIST_OFFSET + 2)).toEqual({
+    kind: "bounty",
+    index: 9,
+  });
+  // The post row is the 4th window row and routes to bounty-post (the sentinel).
+  expect(hitTest(regions, 1, BODY_TOP + BOUNTIES_LIST_OFFSET + 3)).toEqual({ kind: "bounty-post" });
+});
+
+test("un-windowed lists (no listCount) still render every row — backward compatible", () => {
+  const v = view({ activeTab: "experts", expertsCount: 3 });
+  expect(bodyRegions(v)).toHaveLength(3);
+  expect(hitTest(bodyRegions(v), 1, BODY_TOP + EXPERTS_LIST_OFFSET)).toEqual({
+    kind: "expert",
+    index: 0,
+  });
 });

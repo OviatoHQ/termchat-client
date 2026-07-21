@@ -227,3 +227,22 @@ test("MeBody: guest lists Log in; signed-in header shows the handle", () => {
   );
   expect(signedIn.lastFrame() ?? "").toContain("alice ✓");
 });
+
+test("windowed list: only the on-screen slice renders, with an '↑/↓ more' hint", () => {
+  const experts = Array.from({ length: 12 }, (_, i) =>
+    card({ user: `exp${String(i).padStart(2, "0")}`, online: true }),
+  );
+  // Window rows 4..7 (start 4, count 4) with the selection inside it.
+  const frame =
+    render(<ExpertsBody experts={experts} sel={5} signedIn start={4} count={4} />).lastFrame() ??
+    "";
+  expect(frame).toContain("exp04"); // first windowed row
+  expect(frame).toContain("exp07"); // last windowed row
+  expect(frame).not.toContain("exp03"); // above the fold
+  expect(frame).not.toContain("exp08"); // below the fold
+  // The caret marks the true selection (index 5), not the first drawn row.
+  expect(frame.split("\n").find((l) => l.includes("exp05"))).toContain("›");
+  // Both overflow directions are advertised (4 above, 4 below).
+  expect(frame).toContain("↑ 4 more");
+  expect(frame).toContain("↓ 4 more");
+});

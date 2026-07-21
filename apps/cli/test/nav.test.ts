@@ -144,3 +144,40 @@ test("DMs new-DM composer: typing edits; Enter submits the handle line; Esc goes
   expect(reduceKey(compose, "", { return: true })).toEqual({ type: "submit", line: "@chef" });
   expect(reduceKey(compose, "", { escape: true })).toEqual({ type: "back" });
 });
+
+test("Lounge: scroll keys move the transcript without disturbing the draft", () => {
+  const lounge = { ...base, draft: "half-typed" };
+  // Arrows + Page keys scroll; the composer is untouched (draft never changes).
+  expect(reduceKey(lounge, "", { upArrow: true })).toEqual({ type: "scroll", to: "up" });
+  expect(reduceKey(lounge, "", { downArrow: true })).toEqual({ type: "scroll", to: "down" });
+  expect(reduceKey(lounge, "", { pageUp: true })).toEqual({ type: "scroll", to: "page-up" });
+  expect(reduceKey(lounge, "", { pageDown: true })).toEqual({ type: "scroll", to: "page-down" });
+  // Esc snaps back to the newest line (only meaningful when scrolled up).
+  expect(reduceKey(lounge, "", { escape: true })).toEqual({ type: "scroll", to: "bottom" });
+  // …and printable keys still type, so scrolling never blocks the composer.
+  expect(reduceKey(lounge, "!", {})).toEqual({ type: "edit-draft", draft: "half-typed!" });
+});
+
+test("DM thread: scroll keys walk the history; Esc stays 'back', not a scroll", () => {
+  const thread = { ...base, activeTab: "dms" as const, dmView: "thread" as const, draft: "hi" };
+  expect(reduceKey(thread, "", { pageUp: true })).toEqual({ type: "scroll", to: "page-up" });
+  expect(reduceKey(thread, "", { upArrow: true })).toEqual({ type: "scroll", to: "up" });
+  // Esc is reserved for leaving the thread (no bottom-snap key here).
+  expect(reduceKey(thread, "", { escape: true })).toEqual({ type: "back" });
+  // Typing still edits the message being composed.
+  expect(reduceKey(thread, "!", {})).toEqual({ type: "edit-draft", draft: "hi!" });
+});
+
+test("DM inbox: arrows move the selection, not the scroll (it's a list, not a transcript)", () => {
+  const inbox = {
+    ...base,
+    activeTab: "dms" as const,
+    dmView: "inbox" as const,
+    itemCount: 3,
+    selection: 1,
+  };
+  expect(reduceKey(inbox, "", { downArrow: true })).toEqual({
+    type: "move-selection",
+    selection: 2,
+  });
+});

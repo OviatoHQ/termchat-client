@@ -68,6 +68,22 @@ export interface HitTestView {
   meCount: number;
   bountiesCount: number;
   sessionsCount: number;
+  /** First item index of the active list tab's on-screen window (0 when the whole list
+   *  fits). Long lists scroll to follow the selection, so a clicked row's y no longer
+   *  equals its index — regions are emitted for the visible window and offset by this.
+   *  Defaults to 0 (render everything) when omitted. */
+  listStart?: number;
+  /** How many rows of the active list are on screen (the window height). Omitted → the
+   *  whole list is drawn. */
+  listCount?: number;
+}
+
+/** The visible [start, end) slice of a list of `total` rows, honouring an optional
+ *  window on the view. `end` is exclusive and clamped to `total`. */
+function listSlice(view: HitTestView, total: number): { start: number; end: number } {
+  const start = Math.max(0, Math.min(view.listStart ?? 0, total));
+  const end = view.listCount == null ? total : Math.min(total, start + view.listCount);
+  return { start, end };
 }
 
 /** The window strip's clickable cells. Built from the SAME `windowStripCells` the
@@ -95,33 +111,52 @@ export function bodyRegions(view: HitTestView): Region[] {
     h: 1,
     target,
   });
+  // Every list tab scrolls the same way: draw only the on-screen window (`listSlice`),
+  // placing item `start + j` at the j-th body row so a click resolves to the true index
+  // even when the list is scrolled. `end - start` rows are emitted, never more than fit.
   if (view.activeTab === "experts") {
-    for (let i = 0; i < view.expertsCount; i++) {
-      regions.push(rowFull(BODY_TOP + EXPERTS_LIST_OFFSET + i, { kind: "expert", index: i }));
+    const { start, end } = listSlice(view, view.expertsCount);
+    for (let i = start; i < end; i++) {
+      regions.push(
+        rowFull(BODY_TOP + EXPERTS_LIST_OFFSET + (i - start), { kind: "expert", index: i }),
+      );
     }
   } else if (view.activeTab === "me") {
-    for (let i = 0; i < view.meCount; i++) {
-      regions.push(rowFull(BODY_TOP + ME_LIST_OFFSET + i, { kind: "me-action", index: i }));
+    const { start, end } = listSlice(view, view.meCount);
+    for (let i = start; i < end; i++) {
+      regions.push(
+        rowFull(BODY_TOP + ME_LIST_OFFSET + (i - start), { kind: "me-action", index: i }),
+      );
     }
   } else if (view.activeTab === "bounties") {
-    // Each open bounty is a claimable row; a "Post a bounty" row sits right after.
-    for (let i = 0; i < view.bountiesCount; i++) {
-      regions.push(rowFull(BODY_TOP + BOUNTIES_LIST_OFFSET + i, { kind: "bounty", index: i }));
+    // The claimable bounties plus the trailing "Post a bounty" row form one selectable
+    // list of `bountiesCount + 1` rows (post = index bountiesCount). Window over all of
+    // them so a scrolled-to-bottom board still shows — and correctly routes — the post row.
+    const { start, end } = listSlice(view, view.bountiesCount + 1);
+    for (let i = start; i < end; i++) {
+      const y = BODY_TOP + BOUNTIES_LIST_OFFSET + (i - start);
+      regions.push(
+        i < view.bountiesCount
+          ? rowFull(y, { kind: "bounty", index: i })
+          : rowFull(y, { kind: "bounty-post" }),
+      );
     }
-    regions.push(
-      rowFull(BODY_TOP + BOUNTIES_LIST_OFFSET + view.bountiesCount, { kind: "bounty-post" }),
-    );
   } else if (view.activeTab === "calls") {
     // Each past session is a row you can select to review (server gates eligibility).
-    for (let i = 0; i < view.sessionsCount; i++) {
-      regions.push(rowFull(BODY_TOP + CALLS_LIST_OFFSET + i, { kind: "session", index: i }));
+    const { start, end } = listSlice(view, view.sessionsCount);
+    for (let i = start; i < end; i++) {
+      regions.push(
+        rowFull(BODY_TOP + CALLS_LIST_OFFSET + (i - start), { kind: "session", index: i }),
+      );
     }
   } else if (view.activeTab === "dms") {
     if (view.dmView === "inbox") {
       // Row 0 = "+ Send new DM"; rows 1..n = the threads (index i → threads[i-1]).
-      const rows = 1 + view.dmThreadCount;
-      for (let i = 0; i < rows; i++) {
-        regions.push(rowFull(BODY_TOP + DMS_INBOX_OFFSET + i, { kind: "dm-row", index: i }));
+      const { start, end } = listSlice(view, 1 + view.dmThreadCount);
+      for (let i = start; i < end; i++) {
+        regions.push(
+          rowFull(BODY_TOP + DMS_INBOX_OFFSET + (i - start), { kind: "dm-row", index: i }),
+        );
       }
     } else if (view.dmView === "thread") {
       // The "‹ see all DMs" back action is the first body row.

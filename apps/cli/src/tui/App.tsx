@@ -15,15 +15,32 @@ import { beginLogin, submitLoginCode } from "../auth.ts";
 import { billingLinkNotice, dashboardNotice } from "../billing.ts";
 import { type Command, type CommandInfo, matchCommands, parseCommand } from "../commands.ts";
 import { clearCredentials, writeCredentials } from "../config.ts";
+import type { DmLine } from "../dm-client.ts";
 import { type DmController, type DmControllerState, createDmController } from "../dm-controller.ts";
 import { writeCallState } from "../line.ts";
 import type { ChatLine, LoungeClient, LoungeState } from "../lounge-client.ts";
 import { MarketplaceClient } from "../marketplace-client.ts";
 import { openUrl } from "../open-url.ts";
 import { PresenceNotifyClient } from "../presence-notify.ts";
-import { hitTest, regionsForView } from "./hit-test.ts";
+import {
+  BOUNTIES_LIST_OFFSET,
+  CALLS_LIST_OFFSET,
+  DMS_INBOX_OFFSET,
+  EXPERTS_LIST_OFFSET,
+  ME_LIST_OFFSET,
+  hitTest,
+  regionsForView,
+} from "./hit-test.ts";
+import { wrappedRows } from "./measure.ts";
 import type { MouseEvent } from "./mouse.ts";
-import { type DmView, type TabId, reduceKey, windowStripCells } from "./nav.ts";
+import { type DmView, type ScrollTo, type TabId, reduceKey, windowStripCells } from "./nav.ts";
+import {
+  listWindow,
+  rawOffsetForAnchor,
+  stepRowOffset,
+  windowByRows,
+  windowTail,
+} from "./scroll.ts";
 import { C, G, cellWidth, nickColor } from "./theme.ts";
 import { ageShort, timeAgo } from "./timeago.ts";
 import { useMouse } from "./use-mouse.ts";
@@ -208,6 +225,30 @@ function fmtMarket(m: ServerMarketplaceMessage): string {
   }
 }
 
+/** The plain (unstyled) text a lounge row renders as — used to measure how many rows it
+ *  wraps to. MUST mirror {@link ChatRow}'s output exactly, or the window over-/under-fills. */
+function chatLineText(l: ChatLine): string {
+  const time = hhmm(l.ts);
+  if (l.kind === "system") return `${time} -!- ${l.text}`;
+  return `${time} <${l.from ?? ""}> ${l.text}`;
+}
+
+/** A DM message's sender label (the same rule {@link DmsBody}'s thread view renders):
+ *  "me" for my own lines, the peer's display name for theirs. */
+function dmSenderLabel(dm: DmControllerState | null, from: string): string {
+  const active = dm?.active ?? null;
+  if (active?.self && from === active.self) return "me";
+  if (from === dm?.activePeer) return (dm?.activeLabel ?? from) || from;
+  return from;
+}
+
+/** The plain text a DM thread row renders as — mirrors {@link DmsBody}'s thread map for
+ *  wrap measurement. */
+function dmLineText(l: DmLine, senderOf: (from: string) => string): string {
+  const body = l.undecryptable ? "[can't decrypt]" : `${l.text}${l.pending ? " …" : ""}`;
+  return ` <${senderOf(l.from)}> ${body}`;
+}
+
 /** Split-screen lounge + paid-marketplace command surface. */
 export function App({
   client,
@@ -239,6 +280,13 @@ export function App({
   // ---- tabbed navigation (docs/UI-EXPLORATION.md, steps 1–2) ----
   const [activeTab, setActiveTab] = useState<TabId>("lounge");
   const [selection, setSelection] = useState(0);
+  // Scrollback position for the two id-anchored transcripts. `null` = pinned to the
+  // newest line (stick-to-bottom); otherwise the id of the line on the bottom visible
+  // row. Anchoring on an id (not a row count) keeps the view put even as the client's
+  // capped ring drops old lines off the top (scroll.ts). The lounge anchor resets on
+  // tab switch; the DM anchor resets when the open thread changes (effects below).
+  const [loungeAnchor, setLoungeAnchor] = useState<string | null>(null);
+  const [dmAnchor, setDmAnchor] = useState<string | null>(null);
   // Highlighted row in the `/` command autocomplete menu.
   const [paletteSel, setPaletteSel] = useState(0);
   // DMs "compose a new DM" mode: the inbox's "+ Send new DM" row switches the bottom
@@ -283,6 +331,13 @@ export function App({
   useEffect(() => {
     dmController?.setFocused(activeTab === "dms" && Boolean(dmState?.activePeer));
   }, [dmController, activeTab, dmState?.activePeer]);
+
+  // Opening a different thread (or closing to the inbox) starts that conversation pinned
+  // to its newest message — a stale scroll position from another peer would be confusing.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset keys off the peer only.
+  useEffect(() => {
+    setDmAnchor(null);
+  }, [dmState?.activePeer]);
 
   // DM notifications are PUSH, not polled: hold a presence socket and refresh the inbox
   // only when the edge nudges us that a DM arrived (the same channel the daemon uses for
@@ -800,6 +855,7 @@ export function App({
   const switchTab = (tab: TabId): void => {
     setActiveTab(tab);
     setSelection(0);
+    setLoungeAnchor(null); // re-pin the lounge to the newest line on every tab switch
     setSummonExpert(null); // leaving Experts abandons an open summon-confirm
     if (tab === "experts") marketplace?.experts(); // refresh the directory on entry
     if (tab === "bounties") marketplace?.bounties(); // refresh the board on entry
@@ -916,12 +972,93 @@ export function App({
     setNotice(`Calling ${e.user} @ ≤ $${e.rate}/min…`);
   };
 
+  // ---- scroll geometry: row budgets + windows shared by the wheel/key handlers AND
+  //      the render below, so a scroll and its redraw always agree on what fits. ----
+  const contentRows = Math.max(1, rows - 1);
+  const mktRows = mktLog.length > 0 ? mktLog.length + 1 : 0;
+  // Footer chrome = the horizontal rule (1) + the notice line + the input/hint line. The
+  // notice can wrap (the long help text is 2 rows on a narrow terminal), so measure it the
+  // same way it draws instead of guessing — otherwise a 2-row notice overflows the box and
+  // corrupts the redraw (the very bug this whole change fixes for the transcript).
+  const noticeRows = wrappedRows(
+    `[${state.self ?? user ?? "guest"}(✓)] ${notice}`,
+    Math.max(1, cols),
+  );
+  const footerReserve = 1 /* rule */ + noticeRows + 1 /* input/hint */;
+  // Content rows minus header chrome (title + window strip) and the footer, plus any
+  // marketplace log. Mirrors the flex layout below; shared with the scroll windows.
+  const baseVisible = Math.max(3, contentRows - 2 /* header */ - footerReserve - mktRows);
+  // Sidebar ~22% of width (clamped); the chat column gets the rest, minus a 1-col margin.
+  const sidebarWidth = Math.min(26, Math.max(14, Math.floor(cols * 0.22)));
+
+  // Lounge transcript, id-anchored (ids coerced to string; the client numbers lines).
+  // WRAP-AWARE: a ChatRow that wraps spans >1 terminal row, so we window by *rendered
+  // rows* (measured exactly as Ink wraps — measure.ts), never by line count. Counting a
+  // wrapped line as one row would overflow the fixed-height box and corrupt the redraw.
+  const loungeColW = Math.max(8, cols - 1 /* margin */ - sidebarWidth);
+  const loungeRowsOf = (l: ChatLine): number => wrappedRows(chatLineText(l), loungeColW);
+  const loungeIds = state.lines.map((l) => String(l.id));
+  const loungeRaw = rawOffsetForAnchor(loungeIds, loungeAnchor);
+  // Probe with the full budget to learn if we're scrolled up; if so, reserve one row for
+  // the "▾ N newer" hint so drawing it never pushes past the terminal height.
+  const loungeProbe = windowByRows(state.lines, baseVisible, loungeRaw, loungeRowsOf);
+  const loungeVisibleRows = Math.max(3, baseVisible - (loungeProbe.hiddenBelow > 0 ? 1 : 0));
+  const loungeWin = windowByRows(state.lines, loungeVisibleRows, loungeRaw, loungeRowsOf);
+
+  // Open DM thread, same wrap-aware windowing over the FULL body width (no sidebar), with
+  // tighter header chrome (back row + query line + a wrapping safety-number line).
+  const dmThreadLines = dmState?.active?.lines ?? [];
+  const dmColW = Math.max(8, cols);
+  const dmRowsOf = (l: (typeof dmThreadLines)[number]): number =>
+    wrappedRows(
+      dmLineText(l, (from) => dmSenderLabel(dmState, from)),
+      dmColW,
+    );
+  const dmIds = dmThreadLines.map((l) => String(l.id));
+  const dmRaw = rawOffsetForAnchor(dmIds, dmAnchor);
+  const dmThreadBase = Math.max(3, baseVisible - 3);
+  const dmProbe = windowByRows(dmThreadLines, dmThreadBase, dmRaw, dmRowsOf);
+  const dmThreadVisibleRows = Math.max(3, dmThreadBase - (dmProbe.hiddenBelow > 0 ? 1 : 0));
+  const dmWin = windowByRows(dmThreadLines, dmThreadVisibleRows, dmRaw, dmRowsOf);
+
+  // Re-anchor a transcript on the line that should sit on the bottom visible row for a
+  // given item offset (null = pinned to the newest, so new messages keep the view live).
+  const anchorAt = (ids: string[], offset: number, max: number): string | null => {
+    const next = Math.min(Math.max(0, offset), Math.max(0, max));
+    return next === 0 ? null : (ids[ids.length - 1 - next] ?? null);
+  };
+  // Apply a keyboard scroll intent to whichever transcript is focused.
+  const scrollActive = (to: ScrollTo): void => {
+    if (activeTab === "lounge") {
+      const next = stepRowOffset(loungeWin.offset, loungeWin.maxOffset, loungeVisibleRows, to);
+      setLoungeAnchor(anchorAt(loungeIds, next, loungeWin.maxOffset));
+    } else if (activeTab === "dms" && dmView === "thread") {
+      const next = stepRowOffset(dmWin.offset, dmWin.maxOffset, dmThreadVisibleRows, to);
+      setDmAnchor(anchorAt(dmIds, next, dmWin.maxOffset));
+    }
+  };
+  // Wheel: a notch nudges ~3 items in one shot (computed from the current offset, so a
+  // multi-notch flick isn't collapsed by React batching the way repeated key steps are).
+  const wheelActive = (dir: "up" | "down"): void => {
+    const delta = dir === "up" ? 3 : -3;
+    if (activeTab === "lounge") {
+      setLoungeAnchor(anchorAt(loungeIds, loungeWin.offset + delta, loungeWin.maxOffset));
+    } else if (activeTab === "dms" && dmView === "thread") {
+      setDmAnchor(anchorAt(dmIds, dmWin.offset + delta, dmWin.maxOffset));
+    }
+  };
+
   // Mouse (step 3): route a left-click through the same region map the layout draws,
-  // to the same `switchTab`/`activate` handlers the keyboard uses. Clicks only for
-  // now — wheel scroll pairs with the deferred Lounge scrollback. This is redefined
-  // each render (reading current values via closure); `useMouse` keeps the latest in
-  // a ref and subscribes once, so it needn't be memoised.
+  // to the same `switchTab`/`activate` handlers the keyboard uses. The wheel scrolls the
+  // transcript under the cursor. This is redefined each render (reading current values
+  // via closure); `useMouse` keeps the latest in a ref and subscribes once.
   const handleMouse = (event: MouseEvent): void => {
+    // Wheel: scroll the focused transcript (lounge log / open DM thread). ~3 items a notch
+    // (smaller than a PageUp) matches typical terminal feel; list tabs follow selection.
+    if (event.type === "scroll") {
+      wheelActive(event.scroll === "up" ? "up" : "down");
+      return;
+    }
     if (event.type !== "down" || event.button !== "left") return;
     const regions = regionsForView({
       activeTab,
@@ -933,6 +1070,9 @@ export function App({
       meCount: meActions.length,
       bountiesCount: bounties.length,
       sessionsCount: sessions.length,
+      // Mirror the on-screen list window so a click on a scrolled list maps to the true
+      // index, not the screen row (scroll.ts + the body window props must agree).
+      ...(activeListWin ? { listStart: activeListWin.start, listCount: activeListWin.count } : {}),
     });
     const target = hitTest(regions, event.x, event.y);
     if (!target) return;
@@ -1051,6 +1191,9 @@ export function App({
         case "activate":
           activate(activeTab, sel);
           break;
+        case "scroll":
+          scrollActive(action.to);
+          break;
       }
     },
     { isActive: staticInput !== true },
@@ -1132,23 +1275,35 @@ export function App({
   const winRight = call ? `${G.summon} ${meterClock} ` : "";
   const winPad = " ".repeat(Math.max(1, cols - winLeftW - cellWidth(winRight)));
 
-  // Sidebar ~22% of width (clamped); chat gets the rest.
-  const sidebarWidth = Math.min(26, Math.max(14, Math.floor(cols * 0.22)));
-  // Render ONE row shorter than the terminal. When Ink's output height equals the
-  // terminal height, every repaint (cursor blink, keystroke, incoming message) does a
-  // full erase-and-redraw that scroll-jitters the bottom line — the whole screen
-  // "flickers". Leaving the last row empty keeps output < terminal height, so Ink does
-  // smooth partial updates instead. See the blink note on useBlink.
-  const contentRows = Math.max(1, rows - 1);
-  // Window the transcript to what fits: content rows minus header chrome (title +
-  // tab strip) + footer chrome (status, notice, input) and the optional mkt log.
-  const mktRows = mktLog.length > 0 ? mktLog.length + 1 : 0;
-  const visible = Math.max(3, contentRows - 2 /* header */ - 3 /* footer */ - mktRows);
-  const shown = state.lines.slice(-visible);
-  // The DM thread view has taller header chrome than the lounge (back row + query
-  // header + up to 2 safety-number rows), so window its messages a little tighter to
-  // keep the bottom input line on-screen for long conversations.
-  const dmVisible = Math.max(3, visible - 3);
+  // NB: `contentRows`, `baseVisible`, `sidebarWidth`, and the `loungeWin`/`dmWin` scroll
+  // windows are computed up by the scroll-geometry block (shared with the wheel + key
+  // handlers). The App renders ONE row shorter than the terminal so Ink does smooth
+  // partial updates instead of a full flicker-y erase-and-redraw (blink note on useBlink).
+  const shown = loungeWin.shown;
+
+  // Window the active list tab to the rows that fit, keeping the selection on screen
+  // (scroll.ts `listWindow`). Reserve a row for the "↑/↓ more" hint when it overflows so
+  // the footer never gets pushed off. Body chrome (headers) sits above each list, so the
+  // usable rows are `baseVisible` minus that tab's offset; matches hit-test's constants.
+  const listRows = (offset: number, extra = 0): number => Math.max(1, baseVisible - offset - extra);
+  const expertsWin = listWindow(experts.length, listRows(EXPERTS_LIST_OFFSET, 1), sel);
+  const bountiesWin = listWindow(bounties.length + 1, listRows(BOUNTIES_LIST_OFFSET, 1), sel);
+  const callsWin = listWindow(sessions.length, listRows(CALLS_LIST_OFFSET, 1), sel);
+  const meWin = listWindow(meActions.length, listRows(ME_LIST_OFFSET, 1), sel);
+  const inboxWin = listWindow(1 + dmThreadCount, listRows(DMS_INBOX_OFFSET, 1), sel);
+  // The window whose geometry the click hit-tester must mirror for the active list tab.
+  const activeListWin =
+    activeTab === "experts"
+      ? expertsWin
+      : activeTab === "bounties"
+        ? bountiesWin
+        : activeTab === "calls"
+          ? callsWin
+          : activeTab === "me"
+            ? meWin
+            : activeTab === "dms" && dmView === "inbox"
+              ? inboxWin
+              : null;
 
   return (
     <Box flexDirection="column" width={cols} height={contentRows}>
@@ -1215,11 +1370,22 @@ export function App({
       {/* body: the active tab */}
       {activeTab === "lounge" && (
         <Box flexGrow={1}>
-          <Box flexDirection="column" flexGrow={1} marginRight={1}>
+          {/* justifyContent flex-end keeps the newest message hugging the divider/input
+              (chat-app style); any slack from a short transcript falls at the TOP, not as
+              a gap above the input. */}
+          <Box flexDirection="column" flexGrow={1} marginRight={1} justifyContent="flex-end">
             {shown.length === 0 ? (
               <Text color={C.muted2}>No messages yet. Say hi!</Text>
             ) : (
               shown.map((line) => <ChatRow key={line.id} line={line} self={who} />)
+            )}
+            {/* scrolled-up marker: only shows when there ARE newer lines below the fold,
+                which only happens once the log overflows — so it always lands on the
+                bottom row of a full window (its row is reserved out of `loungeVisible`). */}
+            {loungeWin.hiddenBelow > 0 && (
+              <Text
+                color={C.muted2}
+              >{`▾ ${loungeWin.hiddenBelow} newer — PgDn / ↓ · Esc for latest`}</Text>
             )}
           </Box>
           <Box
@@ -1235,20 +1401,34 @@ export function App({
             {state.members.length === 0 ? (
               <Text color={C.muted2}> — quiet —</Text>
             ) : (
-              state.members.map((m) => {
-                const isSelf = m.user === who;
+              (() => {
+                // The roster isn't selectable, so it can't "scroll to follow" anything —
+                // window it to the rows that fit and note the overflow. Members reorder as
+                // presence changes, so a static "+N more" is steadier than a wheel offset.
+                const cap = Math.max(1, baseVisible - 1 /* the "#ROOM · N" header */);
+                const overflow = state.members.length > cap;
+                const membersShown = overflow ? state.members.slice(0, cap - 1) : state.members;
+                const hidden = state.members.length - membersShown.length;
                 return (
-                  <Text key={m.user}>
-                    <Text color={m.verified ? C.accent : C.muted}>
-                      {m.verified ? ` ${G.online}` : ` ${G.offline}`}
-                    </Text>
-                    <Text {...nickProps(m.user, isSelf)}>{` ${m.user}`}</Text>
-                    <Text
-                      color={C.muted2}
-                    >{`${m.verified ? " ✓" : ""}${m.topic ? ` ${m.topic}` : ""}`}</Text>
-                  </Text>
+                  <>
+                    {membersShown.map((m) => {
+                      const isSelf = m.user === who;
+                      return (
+                        <Text key={m.user}>
+                          <Text color={m.verified ? C.accent : C.muted}>
+                            {m.verified ? ` ${G.online}` : ` ${G.offline}`}
+                          </Text>
+                          <Text {...nickProps(m.user, isSelf)}>{` ${m.user}`}</Text>
+                          <Text
+                            color={C.muted2}
+                          >{`${m.verified ? " ✓" : ""}${m.topic ? ` ${m.topic}` : ""}`}</Text>
+                        </Text>
+                      );
+                    })}
+                    {hidden > 0 && <Text color={C.muted2}>{` +${hidden} more`}</Text>}
+                  </>
                 );
-              })
+              })()
             )}
             <Box flexGrow={1} />
           </Box>
@@ -1258,7 +1438,13 @@ export function App({
         (summonExpert ? (
           <SummonConfirmBody expert={summonExpert} problem={draft} cursorOn={cursorOn} />
         ) : (
-          <ExpertsBody experts={experts} sel={sel} signedIn={Boolean(marketplace && user)} />
+          <ExpertsBody
+            experts={experts}
+            sel={sel}
+            signedIn={Boolean(marketplace && user)}
+            start={expertsWin.start}
+            count={expertsWin.count}
+          />
         ))}
       {activeTab === "bounties" && (
         <BountiesBody
@@ -1266,6 +1452,8 @@ export function App({
           sel={sel}
           signedIn={Boolean(marketplace && user)}
           now={now}
+          start={bountiesWin.start}
+          count={bountiesWin.count}
         />
       )}
       {activeTab === "calls" && (
@@ -1274,9 +1462,20 @@ export function App({
           sessions={sessions}
           sel={sel}
           signedIn={Boolean(marketplace && user)}
+          start={callsWin.start}
+          count={callsWin.count}
         />
       )}
-      {activeTab === "me" && <MeBody actions={meActions} sel={sel} user={user} self={state.self} />}
+      {activeTab === "me" && (
+        <MeBody
+          actions={meActions}
+          sel={sel}
+          user={user}
+          self={state.self}
+          start={meWin.start}
+          count={meWin.count}
+        />
+      )}
       {activeTab === "dms" && (
         <DmsBody
           dm={dmState}
@@ -1284,7 +1483,10 @@ export function App({
           signedIn={Boolean(dmController && user)}
           dmView={dmView}
           now={now}
-          maxLines={dmVisible}
+          threadLines={dmWin.shown}
+          moreBelow={dmWin.hiddenBelow}
+          start={inboxWin.start}
+          count={inboxWin.count}
         />
       )}
 
@@ -1299,6 +1501,11 @@ export function App({
           ))}
         </Box>
       )}
+
+      {/* horizontal rule dividing the transcript above from the notice + input below.
+          Full-width; consumes the row the footer budget reserves for it (baseVisible's
+          footer allowance), so it costs no extra height and closes the old blank gap. */}
+      <Text color={C.line}>{"─".repeat(Math.max(1, cols))}</Text>
 
       {/* notice row: `[nick(✓)]` + the transient status/help message */}
       <Text>
@@ -1361,16 +1568,41 @@ export function CommandPalette({
   );
 }
 
+/** The visible window of a list: `items.slice(start, start+count)`, mapping the drawn
+ *  index `j` back to the true index `start + j`. `count == null` draws the whole list. */
+function windowSlice<T>(items: T[], start = 0, count?: number): { item: T; i: number }[] {
+  const end = count == null ? items.length : Math.min(items.length, start + count);
+  const out: { item: T; i: number }[] = [];
+  for (let i = start; i < end; i++) out.push({ item: items[i] as T, i });
+  return out;
+}
+
+/** A subtle "N above / N below the fold" hint for a windowed list tab, so a scrolled
+ *  list still tells you there's more. Renders nothing when the whole list fits. */
+function ListMore({ above, below }: { above: number; below: number }): React.ReactElement | null {
+  if (above <= 0 && below <= 0) return null;
+  const parts = [above > 0 ? `↑ ${above} more` : "", below > 0 ? `↓ ${below} more` : ""].filter(
+    Boolean,
+  );
+  return <Text color={C.muted2}>{`   ${parts.join("  ·  ")}`}</Text>;
+}
+
 /** Experts tab: a browsable directory over `marketplace.experts()`. */
 export function ExpertsBody({
   experts,
   sel,
   signedIn,
+  start = 0,
+  count,
 }: {
   experts: ExpertCard[];
   sel: number;
   signedIn: boolean;
+  /** First on-screen index + how many rows fit (long lists scroll to follow `sel`). */
+  start?: number;
+  count?: number;
 }): React.ReactElement {
+  const end = count == null ? experts.length : Math.min(experts.length, start + count);
   return (
     <Box flexDirection="column" flexGrow={1}>
       <Text color={C.muted}> EXPERTS — LIVE NOW · SORTED BY RATING</Text>
@@ -1379,7 +1611,7 @@ export function ExpertsBody({
       ) : experts.length === 0 ? (
         <Text color={C.muted2}> No experts listed right now.</Text>
       ) : (
-        experts.map((e, i) => {
+        windowSlice(experts, start, count).map(({ item: e, i }) => {
           const active = i === sel;
           const stars = e.rating != null ? `★${e.rating.toFixed(1)} (${e.ratingCount})` : "★ new";
           const topics = e.topics.join(" ") || "any";
@@ -1407,6 +1639,7 @@ export function ExpertsBody({
           );
         })
       )}
+      {signedIn && experts.length > 0 && <ListMore above={start} below={experts.length - end} />}
     </Box>
   );
 }
@@ -1483,11 +1716,16 @@ export function BountiesBody({
   sel,
   signedIn,
   now,
+  start = 0,
+  count,
 }: {
   bounties: BountyCard[];
   sel: number;
   signedIn: boolean;
   now: number;
+  /** Window over the claimable rows + the trailing "post" row (long boards scroll). */
+  start?: number;
+  count?: number;
 }): React.ReactElement {
   if (!signedIn) {
     return (
@@ -1497,11 +1735,30 @@ export function BountiesBody({
       </Box>
     );
   }
-  const postActive = sel === bounties.length;
+  // The claimable bounties and the "post a bounty" action are ONE selectable list of
+  // `bounties.length + 1` rows (post = the last index) — window over all of them so a
+  // long board still shows the post row when scrolled to the bottom.
+  const total = bounties.length + 1;
+  const end = count == null ? total : Math.min(total, start + count);
+  const postIndex = bounties.length;
   return (
     <Box flexDirection="column" flexGrow={1}>
       <Text color={C.muted}> BOUNTIES — ASYNC QUESTIONS, FIXED PRICE</Text>
-      {bounties.map((b, i) => {
+      {Array.from({ length: end - start }, (_, j) => {
+        const i = start + j;
+        if (i === postIndex) {
+          const postActive = sel === postIndex;
+          return (
+            <Text key="post" {...(postActive ? { backgroundColor: C.rowHighlight } : {})}>
+              <Text color={C.accent}>{postActive ? "›" : " "}</Text>
+              <Text color={C.accent}>{" [post a bounty]"}</Text>
+              <Text color={C.muted2}>
+                {"  money is held, not charged — you pay only when you accept"}
+              </Text>
+            </Text>
+          );
+        }
+        const b = bounties[i] as BountyCard;
         const active = i === sel;
         const topic = b.topic ?? "any";
         const q = b.question.length > 44 ? `${b.question.slice(0, 43)}…` : b.question;
@@ -1517,16 +1774,10 @@ export function BountiesBody({
           </Text>
         );
       })}
-      <Text {...(postActive ? { backgroundColor: C.rowHighlight } : {})}>
-        <Text color={C.accent}>{postActive ? "›" : " "}</Text>
-        <Text color={C.accent}>{" [post a bounty]"}</Text>
-        <Text color={C.muted2}>
-          {"  money is held, not charged — you pay only when you accept"}
-        </Text>
-      </Text>
       {bounties.length === 0 && (
         <Text color={C.muted2}> No open bounties yet — post one above.</Text>
       )}
+      <ListMore above={start} below={total - end} />
     </Box>
   );
 }
@@ -1540,12 +1791,18 @@ export function CallsBody({
   sessions,
   sel,
   signedIn,
+  start = 0,
+  count,
 }: {
   active: number | null;
   sessions: SessionCard[];
   sel: number;
   signedIn: boolean;
+  /** First on-screen session index + how many rows fit (long histories scroll). */
+  start?: number;
+  count?: number;
 }): React.ReactElement {
+  const end = count == null ? sessions.length : Math.min(sessions.length, start + count);
   if (!signedIn) {
     return (
       <Box flexDirection="column" flexGrow={1}>
@@ -1569,7 +1826,7 @@ export function CallsBody({
       <Text color={C.muted2}>
         {sessions.length === 0 ? " no past calls yet" : " past calls — select one to review:"}
       </Text>
-      {sessions.map((s, i) => {
+      {windowSlice(sessions, start, count).map(({ item: s, i }) => {
         const active_ = i === sel;
         const isExpert = s.role === "expert";
         const tag = s.reviewed
@@ -1590,6 +1847,7 @@ export function CallsBody({
           </Text>
         );
       })}
+      <ListMore above={start} below={sessions.length - end} />
     </Box>
   );
 }
@@ -1600,12 +1858,18 @@ export function MeBody({
   sel,
   user,
   self,
+  start = 0,
+  count,
 }: {
   actions: { label: string }[];
   sel: number;
   user: string | null;
   self: string | null;
+  /** Window over the action rows (the Me list is short, but stays uniform with the rest). */
+  start?: number;
+  count?: number;
 }): React.ReactElement {
+  const end = count == null ? actions.length : Math.min(actions.length, start + count);
   return (
     <Box flexDirection="column" flexGrow={1}>
       <Text color={C.muted}> ME</Text>
@@ -1626,7 +1890,7 @@ export function MeBody({
         {" "}
         card entry and payouts always open in the browser — never the terminal
       </Text>
-      {actions.map((a, i) => {
+      {windowSlice(actions, start, count).map(({ item: a, i }) => {
         const active = i === sel;
         return (
           <Text key={a.label} {...(active ? { backgroundColor: C.rowHighlight } : {})}>
@@ -1635,6 +1899,7 @@ export function MeBody({
           </Text>
         );
       })}
+      <ListMore above={start} below={actions.length - end} />
     </Box>
   );
 }
@@ -1652,14 +1917,30 @@ export function DmsBody({
   dmView,
   now,
   maxLines = 200,
+  offset = 0,
+  threadLines,
+  moreBelow = 0,
+  start = 0,
+  count,
 }: {
   dm: DmControllerState | null;
   sel: number;
   signedIn: boolean;
   dmView: DmView;
   now: number;
-  /** Window the open thread's messages to the last N so the input line stays on-screen. */
+  /** Fallback windowing (tests): last `maxLines` messages scrolled up by `offset`. Used
+   *  only when the App doesn't pass a pre-measured `threadLines` window. */
   maxLines?: number;
+  offset?: number;
+  /** The App's wrap-aware window of the open thread (already the exact rows that fit) and
+   *  how many newer messages sit below it (drives the "▾ N newer" hint). When provided,
+   *  these win over the `maxLines`/`offset` fallback. */
+  threadLines?: DmLine[];
+  moreBelow?: number;
+  /** Inbox window: first on-screen row + how many rows fit (long inboxes scroll). Rows
+   *  are [+ Send new DM, ...threads], so index 0 = new-DM, index i≥1 = threads[i-1]. */
+  start?: number;
+  count?: number;
 }): React.ReactElement {
   if (!signedIn) {
     return (
@@ -1698,6 +1979,10 @@ export function DmsBody({
       return from;
     };
     const isMine = (from: string): boolean => Boolean(active?.self && from === active.self);
+    // Prefer the App's wrap-aware window; fall back to a simple tail slice for tests.
+    const fallback = windowTail(active?.lines ?? [], maxLines, offset);
+    const shownLines = threadLines ?? fallback.shown;
+    const hiddenNewer = threadLines ? moreBelow : fallback.hiddenBelow;
     return (
       <Box flexDirection="column" flexGrow={1}>
         {/* back action — FIRST body row (hit-test dm-back pins to BODY_TOP) */}
@@ -1716,8 +2001,9 @@ export function DmsBody({
         ) : (active?.lines.length ?? 0) === 0 ? (
           <Text color={C.muted2}> No messages yet. Type below to say hi.</Text>
         ) : (
-          (active?.lines ?? []).slice(-maxLines).map((l) => (
-            <Text key={l.id} {...(l.pending ? { dimColor: true } : {})}>
+          shownLines.map((l) => (
+            // color on the parent so a wrapped message keeps its color on rows 2+ (see ChatRow).
+            <Text key={l.id} color={C.fg} {...(l.pending ? { dimColor: true } : {})}>
               <Text color={C.muted}>{" <"}</Text>
               <Text {...nickProps(senderLabel(l.from), isMine(l.from))}>{senderLabel(l.from)}</Text>
               <Text color={C.muted}>{"> "}</Text>
@@ -1727,39 +2013,50 @@ export function DmsBody({
             </Text>
           ))
         )}
+        {hiddenNewer > 0 && <Text color={C.muted2}>{`   ▾ ${hiddenNewer} newer — PgDn / ↓`}</Text>}
       </Box>
     );
   }
 
-  // inbox — "+ Send new DM" is row 0 (index 0); threads follow (row i → index i).
+  // inbox — one selectable list of [+ Send new DM (index 0), ...threads (index i→i-1)].
+  // Window over the whole thing so the "new DM" row and a long thread list both scroll
+  // to follow the selection; the caret uses the TRUE index so hit-test stays aligned.
   const threads = dm?.threads ?? [];
+  const total = 1 + threads.length;
+  const end = count == null ? total : Math.min(total, start + count);
   return (
     <Box flexDirection="column" flexGrow={1}>
-      <Text {...(sel === 0 ? { backgroundColor: C.rowHighlight } : {})}>
-        <Text color={C.accent}>{sel === 0 ? "›" : " "}</Text>
-        <Text color={sel === 0 ? C.fgBright : C.accent} bold={sel === 0}>
-          {" + Send new DM"}
-        </Text>
-      </Text>
-      {threads.length === 0 ? (
-        <Text color={C.muted2}> No conversations yet — start one above.</Text>
-      ) : (
-        threads.map((t, i) => {
-          const on = sel === i + 1;
-          const name = t.displayName ?? t.peer;
+      {Array.from({ length: end - start }, (_, j) => {
+        const i = start + j;
+        if (i === 0) {
           return (
-            <Text key={t.peer} {...(on ? { backgroundColor: C.rowHighlight } : {})}>
-              <Text color={C.accent}>{on ? "›" : " "}</Text>
-              {/* unread marker: lime ● when unread, else a matching-width blank */}
-              <Text color={t.unread > 0 ? C.accent : C.muted2}>
-                {t.unread > 0 ? ` ${G.online}` : "  "}
+            <Text key="new" {...(sel === 0 ? { backgroundColor: C.rowHighlight } : {})}>
+              <Text color={C.accent}>{sel === 0 ? "›" : " "}</Text>
+              <Text color={sel === 0 ? C.fgBright : C.accent} bold={sel === 0}>
+                {" + Send new DM"}
               </Text>
-              <Text {...nickProps(name, on)}>{` @${name}`}</Text>
-              <Text color={C.muted2}>{`  ${timeAgo(t.lastTs, now)}`}</Text>
             </Text>
           );
-        })
+        }
+        const t = threads[i - 1] as (typeof threads)[number];
+        const on = sel === i;
+        const name = t.displayName ?? t.peer;
+        return (
+          <Text key={t.peer} {...(on ? { backgroundColor: C.rowHighlight } : {})}>
+            <Text color={C.accent}>{on ? "›" : " "}</Text>
+            {/* unread marker: lime ● when unread, else a matching-width blank */}
+            <Text color={t.unread > 0 ? C.accent : C.muted2}>
+              {t.unread > 0 ? ` ${G.online}` : "  "}
+            </Text>
+            <Text {...nickProps(name, on)}>{` @${name}`}</Text>
+            <Text color={C.muted2}>{`  ${timeAgo(t.lastTs, now)}`}</Text>
+          </Text>
+        );
+      })}
+      {threads.length === 0 && (
+        <Text color={C.muted2}> No conversations yet — start one above.</Text>
       )}
+      <ListMore above={start} below={total - end} />
     </Box>
   );
 }
@@ -1795,9 +2092,14 @@ function DmHeader({
  *  `HH:MM -!- text` notice in muted grey. Nicks hash to a stable "wire" color. */
 function ChatRow({ line, self }: { line: ChatLine; self: string | null }): React.ReactElement {
   const time = hhmm(line.ts);
+  // The color on the OUTER <Text> is load-bearing, not redundant: when a line wraps to 3+
+  // rows, Ink/wrap-ansi drops the inner segment's color on the continuation rows, which
+  // then render in the terminal's default (bright white). Setting the row's dominant color
+  // on the parent makes the wrapped remainder inherit it instead. (Verified: without it,
+  // continuation rows have no leading SGR; with it, they carry the parent color.)
   if (line.kind === "system") {
     return (
-      <Text>
+      <Text color={C.muted2}>
         <Text color={C.muted2}>{`${time} -!- `}</Text>
         <Text color={C.muted2}>{line.text}</Text>
       </Text>
@@ -1805,7 +2107,7 @@ function ChatRow({ line, self }: { line: ChatLine; self: string | null }): React
   }
   const isSelf = line.from != null && line.from === self;
   return (
-    <Text>
+    <Text color={C.fg}>
       <Text color={C.muted2}>{`${time} `}</Text>
       <Text color={C.muted}>{"<"}</Text>
       <Text {...nickProps(line.from ?? "", isSelf)}>{line.from}</Text>

@@ -49,6 +49,8 @@ export interface KeyLike {
   shift?: boolean;
   upArrow?: boolean;
   downArrow?: boolean;
+  pageUp?: boolean;
+  pageDown?: boolean;
   return?: boolean;
   backspace?: boolean;
   delete?: boolean;
@@ -56,6 +58,10 @@ export interface KeyLike {
   ctrl?: boolean;
   meta?: boolean;
 }
+
+/** How a scroll key wants to move a transcript viewport. Resolved to an actual offset
+ *  in the App (which knows the visible row count); see scroll.ts `ScrollTo`. */
+export type ScrollTo = "up" | "down" | "page-up" | "page-down" | "bottom";
 
 /** DMs sub-view (see DM-IMPROVEMENTS.md): the inbox list, an open thread, or the
  *  "new DM" composer. Drives which keys the DMs pane accepts. */
@@ -91,6 +97,8 @@ export type NavAction =
   | { type: "palette-move"; delta: number }
   | { type: "palette-accept" }
   | { type: "palette-close" }
+  // scroll the active transcript (lounge log / open DM thread) without stealing typing
+  | { type: "scroll"; to: ScrollTo }
   | { type: "none" };
 
 function cycle(current: TabId, dir: 1 | -1): TabId {
@@ -133,6 +141,14 @@ export function reduceKey(state: NavState, input: string, key: KeyLike): NavActi
 
   if (state.activeTab === "lounge") {
     if (key.return) return { type: "submit", line: state.draft };
+    // The composer is always focused (type freely, like Claude Code); scrollback rides
+    // the keys that carry no printable input, so nothing competes with typing. Esc snaps
+    // back to the newest line.
+    if (key.pageUp) return { type: "scroll", to: "page-up" };
+    if (key.pageDown) return { type: "scroll", to: "page-down" };
+    if (key.upArrow) return { type: "scroll", to: "up" };
+    if (key.downArrow) return { type: "scroll", to: "down" };
+    if (key.escape) return { type: "scroll", to: "bottom" };
     if (key.backspace || key.delete) return { type: "edit-draft", draft: state.draft.slice(0, -1) };
     if (input && !key.ctrl && !key.meta) return { type: "edit-draft", draft: state.draft + input };
     return { type: "none" };
@@ -163,6 +179,15 @@ export function reduceKey(state: NavState, input: string, key: KeyLike): NavActi
     if (key.return) {
       if (view === "new") return { type: "submit", line: state.draft };
       return state.draft.trim() ? { type: "submit", line: state.draft } : { type: "none" };
+    }
+    // Scroll the open thread's history (Esc is taken for "back", so no bottom-snap key
+    // here — PageDown/↓ walk back to the newest line instead). The "new" composer has no
+    // transcript, so its scroll keys are harmless no-ops the App ignores.
+    if (view === "thread") {
+      if (key.pageUp) return { type: "scroll", to: "page-up" };
+      if (key.pageDown) return { type: "scroll", to: "page-down" };
+      if (key.upArrow) return { type: "scroll", to: "up" };
+      if (key.downArrow) return { type: "scroll", to: "down" };
     }
     if (key.backspace || key.delete) return { type: "edit-draft", draft: state.draft.slice(0, -1) };
     if (input && !key.ctrl && !key.meta) return { type: "edit-draft", draft: state.draft + input };
