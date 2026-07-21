@@ -22,7 +22,9 @@ export type Command =
   | { kind: "onboard" }
   // marketplace
   | { kind: "expert"; on: boolean; rate?: number; topics: string[] }
-  | { kind: "summon"; maxRate: number; problem: string; target?: string; code?: string }
+  /** `maxRate` is absent exactly for a comped (`code`) call — those bill $0 and always
+   *  name a `target`; the edge enforces both pairings. */
+  | { kind: "summon"; maxRate?: number; problem: string; target?: string; code?: string }
   | { kind: "accept"; reqId?: string }
   | { kind: "decline"; reqId?: string }
   | { kind: "end" }
@@ -163,7 +165,8 @@ export function parseCommand(input: string): Command | null {
       return parseExpert(rest);
     case "call":
     case "summon": {
-      // /call [--code <CODE>] [@handle] <maxRate> <problem…>   (/summon is a legacy alias)
+      // /call [@handle] <maxRate> <problem…>            (/summon is a legacy alias)
+      // /call --code <CODE> @handle <problem…>          free call — no rate, handle required
       // A leading @handle targets ONE named expert directly; without it, the call
       // is the open topic/rate auction. The @ sigil is required to disambiguate a
       // handle from a (malformed) rate. The rate cap applies in both forms.
@@ -177,7 +180,7 @@ export function parseCommand(input: string): Command | null {
         if (!code) {
           return {
             kind: "invalid",
-            reason: "usage: /call --code <CODE> [@handle] <maxRate> <problem>",
+            reason: "usage: /call --code <CODE> @<handle> <problem>",
           };
         }
         parts = parts.filter((_, i) => i !== codeIdx && i !== codeIdx + 1);
@@ -190,12 +193,26 @@ export function parseCommand(input: string): Command | null {
           return { kind: "invalid", reason: "usage: /call @<handle> <maxRate> <problem>" };
         }
       }
+      // A free call takes NO rate: it's $0 by construction, and it must name someone
+      // (there's no free auction). Everything after the handle is the problem — so a
+      // problem may legitimately start with a number.
+      if (code) {
+        const problem = parts.join(" ").trim();
+        if (!target || !problem) {
+          return {
+            kind: "invalid",
+            reason: "usage: /call --code <CODE> @<handle> <problem>",
+          };
+        }
+        return { kind: "summon", problem, target, code };
+      }
       const maxRate = Number.parseFloat(parts[0] ?? "");
       const problem = parts.slice(1).join(" ").trim();
       if (!Number.isFinite(maxRate) || !problem) {
         return {
           kind: "invalid",
-          reason: "usage: /call [--code <CODE>] [@handle] <maxRate> <problem>",
+          reason:
+            "usage: /call [@handle] <maxRate> <problem>  |  /call --code <CODE> @<handle> <problem>",
         };
       }
       return {
@@ -203,7 +220,6 @@ export function parseCommand(input: string): Command | null {
         maxRate,
         problem,
         ...(target ? { target } : {}),
-        ...(code ? { code } : {}),
       };
     }
     case "accept":

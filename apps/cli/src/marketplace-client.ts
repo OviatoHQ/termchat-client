@@ -28,6 +28,11 @@ export class MarketplaceClient {
   latestOfferReqId: string | null = null;
   activeSessionId: number | null = null;
   lastEndedSessionId: number | null = null;
+  /** Set once the socket closes or errors. Deliberately NOT "has opened": a command
+   *  typed in the moment before `open` fires must still be attempted, not rejected. */
+  private down = false;
+  /** Only announce a drop once per connection, so a close+error pair isn't two lines. */
+  private announcedDrop = false;
 
   constructor(private readonly options: MarketplaceClientOptions) {}
 
@@ -45,6 +50,15 @@ export class MarketplaceClient {
     const url = `${this.options.wsBase}/marketplace?clientId=${encodeURIComponent(this.options.clientId)}`;
     const ws = factory(url, [AUTH_SUBPROTOCOL, this.options.token]);
     this.ws = ws;
+    // Connection health is surfaced, never swallowed: a dead marketplace socket makes
+    // EVERY command (/call, /expert, /experts…) a silent no-op, which reads to the user
+    // as "the app is stuck". Report it as a system line so the failure is visible.
+    ws.addEventListener("open", () => {
+      this.down = false;
+      this.announcedDrop = false;
+    });
+    ws.addEventListener("close", () => this.onDisconnect());
+    ws.addEventListener("error", () => this.onDisconnect());
     ws.addEventListener("message", (event) => {
       const data = typeof event.data === "string" ? event.data : "";
       if (!data || data === PONG) return;
@@ -88,7 +102,8 @@ export class MarketplaceClient {
   }
   summon(input: {
     problem: string;
-    maxRate: number;
+    /** Omitted for a comped (`code`) call — those are $0 and take no rate cap. */
+    maxRate?: number;
     topic?: TopicTag;
     maxMinutes?: number;
     /** Targeted summon: address one named expert by handle instead of the auction. */
@@ -157,11 +172,38 @@ export class MarketplaceClient {
     this.ws?.close();
   }
 
+  /** Mark the socket down and tell the UI once — silence here is what made a dead
+   *  socket look like a hung command. */
+  private onDisconnect(): void {
+    this.down = true;
+    if (this.announcedDrop) return;
+    this.announcedDrop = true;
+    this.emit({
+      type: "system",
+      text: "Marketplace connection lost — restart termchat to reconnect.",
+    });
+  }
+
+  private emit(message: ServerMarketplaceMessage): void {
+    for (const listener of this.listeners) listener(message);
+  }
+
   private send(message: ClientMarketplaceMessage): void {
+    if (!this.ws || this.down) {
+      this.emit({
+        type: "system",
+        text: "Not connected to the marketplace — restart termchat and try again.",
+      });
+      return;
+    }
     try {
-      this.ws?.send(JSON.stringify(message));
+      this.ws.send(JSON.stringify(message));
     } catch {
-      // socket not ready / gone
+      // Still connecting (or the socket just died) — say so instead of no-op'ing.
+      this.emit({
+        type: "system",
+        text: "Marketplace isn't connected yet — try that again in a moment.",
+      });
     }
   }
 }

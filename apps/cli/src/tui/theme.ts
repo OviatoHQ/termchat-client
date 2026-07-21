@@ -36,11 +36,6 @@ export const C = {
   fg2: "#a3a17f",
   /** headings, self-nick, bar text */
   fgBright: "#eae6c3",
-  /** OTHER people's handles — chat authors, roster rows, expert/session names. One
-   *  color for everyone: your own handle is the only one that differs (`fgBright`,
-   *  bold), so "which one is me" reads instantly instead of getting lost in a
-   *  per-nick rainbow. */
-  nick: "#9fb08a",
   /** labels, inactive nav */
   muted: "#77754f",
   /** timestamps, hints, faintest text */
@@ -61,6 +56,21 @@ export const C = {
   /** inverse background for the [end] chip in the status bar */
   endInverseBg: "#7a4438",
 } as const;
+
+/**
+ * Nick colors for chat + rosters, assigned by hash of handle. Self renders in
+ * `C.fgBright` bold instead (see `nickColor`). Bracket punctuation `<>` uses `C.muted`.
+ */
+export const NICK_COLORS = ["#aab965", "#8fae9b", "#c7a45a", "#b58a8a", "#a09ac0"] as const;
+
+/** Deterministic nick color: stable hash of the handle → one of NICK_COLORS. */
+export function nickColor(handle: string): string {
+  let h = 0;
+  for (let i = 0; i < handle.length; i++) {
+    h = (h * 31 + handle.charCodeAt(i)) | 0;
+  }
+  return NICK_COLORS[Math.abs(h) % NICK_COLORS.length] ?? NICK_COLORS[0];
+}
 
 /**
  * Approximate terminal cell width of a string, treating the emoji-presentation glyphs

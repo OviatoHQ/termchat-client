@@ -57,16 +57,24 @@ export const ClientMarketplaceMessage = z.discriminatedUnion("type", [
     type: z.literal("summon"),
     topic: TopicTag.optional(),
     problem: ProblemText,
-    maxRate: ExpertRate,
+    /** The seeker's per-minute cap for a PAID call. Omitted for a comped (`code`)
+     *  call, where the rate is $0 by construction and a cap would be meaningless —
+     *  RATE_MIN is 0.5, so there is no in-range value that means "free". The edge
+     *  requires it whenever `code` is absent. */
+    maxRate: ExpertRate.optional(),
     maxMinutes: z.number().int().min(1).max(MAX_MINUTES_CAP).optional(),
-    /** Targeted summon: address ONE named expert by handle (from `/summon @handle …`)
-     *  instead of the open topic/rate auction. The rate cap still applies. Handle is a
-     *  public username (matched case-insensitively on the edge) — no new PII. */
+    /** Targeted summon: address ONE named person by handle (from `/call @handle …`)
+     *  instead of the open topic/rate auction. For a paid call they must be a listed
+     *  expert and the rate cap still applies; for a comped call (`code`) any online,
+     *  verified user qualifies. Handle is a public username (matched case-insensitively
+     *  on the edge) — no new PII. */
     target: z.string().trim().min(1).max(64).optional(),
     /** Free-call promo code (`/call --code …`). An OPAQUE token — the edge does ALL
      *  validation/consumption (this field is safe to publish to the open-source
      *  client). A valid code bypasses the card-on-file gate and books a $0 comped
-     *  session (no Stripe hold/capture). Invalid/expired/exhausted → summon rejected. */
+     *  session (no Stripe hold/capture) with ANY online verified user, listed expert
+     *  or not — they still consent by accepting. A comped call MUST name a `target`;
+     *  there is no free open auction. Invalid/expired/exhausted → summon rejected. */
     code: z.string().trim().min(1).max(64).optional(),
   }),
   z.object({ type: z.literal("accept"), reqId: z.string().min(1).max(64) }),
