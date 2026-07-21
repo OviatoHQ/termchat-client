@@ -1,6 +1,6 @@
 {
   "name": "@termchat/protocol",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Shared wire types + Zod validation for termchat (imported by edge and CLI).",

@@ -10,6 +10,7 @@ import { runDm } from "./dm.ts";
 import { runHook } from "./hooks.ts";
 import { runInstall } from "./install-cli.ts";
 import { renderLine } from "./line.ts";
+import { VERSION } from "./version.ts";
 
 const USAGE = `termchat — terminal presence for the AI era
 
@@ -31,6 +32,7 @@ usage:
   termchat daemon                                  run the presence daemon
   termchat hook <event>                            one-shot hook (used by the coding agent)
   termchat online                                  print the current presence line
+  termchat version                                 print the client version
 `;
 
 async function main(): Promise<void> {
@@ -93,6 +95,11 @@ async function main(): Promise<void> {
     case "--help":
     case "-h":
       process.stdout.write(USAGE);
+      return;
+    case "version":
+    case "--version":
+    case "-v":
+      console.log(`termchat ${VERSION}`);
       return;
     default:
       // Unknown subcommand — show usage (and flag it so a typo isn't silent).
