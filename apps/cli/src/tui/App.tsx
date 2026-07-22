@@ -40,6 +40,7 @@ import {
   type LoungeFocus,
   type ScrollTo,
   type TabId,
+  caretSegments,
   reduceKey,
   windowStripCells,
 } from "./nav.ts";
@@ -331,6 +332,24 @@ export function App({
     initialDmController?.getState() ?? null,
   );
   const [draft, setDraft] = useState("");
+  // Caret position inside `draft`. `null` means "end of line" — the state every path
+  // that replaces the whole draft (clears, command stubs, mention completion, history
+  // recall) wants, and it stays correct without those paths knowing the new length.
+  const [cursor, setCursor] = useState<number | null>(null);
+  const caret = cursor === null ? draft.length : Math.max(0, Math.min(draft.length, cursor));
+  /** Replace the draft and park the caret (default: end of the new text). */
+  const putDraft = useCallback(
+    (next: string | ((d: string) => string), at: number | null = null) => {
+      setDraft(next as string);
+      setCursor(at);
+    },
+    [],
+  );
+  // Sent-message history: ↑/↓ walk it, like a shell. `histIdx === null` means "not
+  // browsing"; `histStash` keeps the half-typed line so ↓ off the end restores it.
+  const [sentHistory, setSentHistory] = useState<string[]>([]);
+  const [histIdx, setHistIdx] = useState<number | null>(null);
+  const histStash = useRef("");
   const [notice, setNoticeText] = useState<string>(initialNotice ?? IDLE_HINT);
   const [noticeTone, setNoticeTone] = useState<NoticeTone>("idle");
   // Every notice carries a tone; "idle" (muted grey, the default) keeps all 70-odd
@@ -762,7 +781,7 @@ export function App({
   // "‹ see all DMs" / Esc: return to the inbox. From the composer, just cancel it; from a
   // thread, close it (keeps the controller alive and reloads the inbox).
   const dmBack = (): void => {
-    setDraft("");
+    putDraft("");
     if (dmComposeNew) {
       setDmComposeNew(false);
       setNotice("");
@@ -1090,7 +1109,7 @@ export function App({
       // Open the summon-confirm view (design 2a): the seeker reviews the hold, types the
       // problem into the input line, and authorizes. Confirm dispatches a targeted summon.
       setSummonExpert(e);
-      setDraft("");
+      putDraft("");
       setNotice(`Describe your problem, then Enter to authorize the hold for ${e.user}.`);
       return;
     }
@@ -1101,7 +1120,7 @@ export function App({
       }
       // The last row is the "Post a bounty" action; earlier rows claim a bounty.
       if (index >= bounties.length) {
-        setDraft("/bounty ");
+        putDraft("/bounty ");
         setActiveTab("lounge");
         setSelection(0);
         setNotice("Type: /bounty <price> <question> then Enter to post.");
@@ -1126,7 +1145,7 @@ export function App({
       }
       // Target this session, then hand off to the Lounge input for the star rating.
       setReviewTarget({ sessionId: s.sessionId, peer: s.peer });
-      setDraft("/review ");
+      putDraft("/review ");
       setActiveTab("lounge");
       setSelection(0);
       setNotice(`Rate ${s.peer} (session #${s.sessionId}): type /review <1-5> [comment].`);
@@ -1141,14 +1160,14 @@ export function App({
       // Inbox convention: index 0 = "+ Send new DM"; index ≥1 = threads[index-1].
       if (index === 0) {
         setDmComposeNew(true);
-        setDraft("");
+        putDraft("");
         setNotice('New DM — type "@username" then your message, Enter to send. Esc to cancel.');
         return;
       }
       const thread = dmState?.threads[index - 1];
       if (thread) {
         setDmComposeNew(false);
-        setDraft("");
+        putDraft("");
         void dmController?.openThread(thread.peer);
       }
     }
@@ -1171,7 +1190,7 @@ export function App({
     marketplace.summon({ problem, maxRate: e.rate, target: e.user });
     callPending.current = true;
     setSummonExpert(null);
-    setDraft("");
+    putDraft("");
     setActiveTab("lounge");
     setSelection(0);
     setNotice(`Calling ${e.user} @ ≤ $${e.rate}/min…`, "call");
@@ -1362,11 +1381,11 @@ export function App({
     if (item.kind === "tag") {
       // Drop an `@handle` into the composer and hand typing back — the mention itself is
       // click/Enter-hittable in the transcript (docs/DMS.md entry point 3).
-      setDraft((d) => (d.endsWith(" ") || d === "" ? `${d}@${peer} ` : `${d} @${peer} `));
+      putDraft((d) => (d.endsWith(" ") || d === "" ? `${d}@${peer} ` : `${d} @${peer} `));
       return;
     }
     if (item.kind === "bounty") {
-      setDraft("/bounty ");
+      putDraft("/bounty ");
       setNotice(`${peer} is offline — post an async bounty: /bounty <price> <question>.`);
       return;
     }
@@ -1380,7 +1399,7 @@ export function App({
     setActiveTab("experts");
     setSelection(Math.max(0, experts.indexOf(e)));
     setSummonExpert(e);
-    setDraft("");
+    putDraft("");
     setNotice(`Describe your problem, then Enter to authorize the hold for ${e.user}.`);
   };
 
@@ -1525,10 +1544,10 @@ export function App({
           return;
         }
         if (key.backspace || key.delete) {
-          setDraft((d) => d.slice(0, -1));
+          putDraft((d) => d.slice(0, -1));
           return;
         }
-        if (input && !key.ctrl && !key.meta) setDraft((d) => d + input);
+        if (input && !key.ctrl && !key.meta) putDraft((d) => d + input);
         return;
       }
       const action = reduceKey(
@@ -1537,6 +1556,7 @@ export function App({
           selection: sel,
           itemCount,
           draft,
+          cursor: caret,
           locked: pendingLogin !== null,
           dmView,
           paletteOpen,
@@ -1591,15 +1611,15 @@ export function App({
           if (!cmd) break;
           setPaletteSel(0);
           if (cmd.args) {
-            setDraft(`/${cmd.name} `); // complete, wait for args (menu closes: has a space)
+            putDraft(`/${cmd.name} `); // complete, wait for args (menu closes: has a space)
           } else {
-            setDraft("");
+            putDraft("");
             submit(`/${cmd.name}`); // no args → run it now
           }
           break;
         }
         case "palette-close": // Esc cancels the command entry
-          setDraft("");
+          putDraft("");
           setPaletteSel(0);
           break;
         case "mention-move": {
@@ -1612,7 +1632,7 @@ export function App({
           // rest of the sentence untouched — you keep typing where you left off.
           const pick = mentionMatches[mentionIdx];
           if (!pick) break;
-          setDraft((d) => `${d.slice(0, d.length - (mentionPrefix(d)?.length ?? 0) - 1)}@${pick} `);
+          putDraft((d) => `${d.slice(0, d.length - (mentionPrefix(d)?.length ?? 0) - 1)}@${pick} `);
           setMentionSel(0);
           break;
         }
@@ -1622,8 +1642,16 @@ export function App({
           setMentionDismissed(draft);
           setMentionSel(0);
           break;
-        case "submit":
-          setDraft("");
+        case "submit": {
+          putDraft("");
+          // Remember what was sent so ↑ can bring it back. Consecutive duplicates collapse
+          // (re-sending the same line shouldn't need two ↑ to get past), and the ring is
+          // capped so a long session can't grow it without bound.
+          const sent = action.line;
+          if (sent.trim()) {
+            setSentHistory((h) => (h[h.length - 1] === sent ? h : [...h, sent]).slice(-200));
+          }
+          setHistIdx(null);
           // In the DMs pane the input is the conversation (thread) or the new-DM composer,
           // not the lounge/command line.
           if (activeTab === "dms") {
@@ -1631,13 +1659,38 @@ export function App({
             else dmController?.sendMessage(action.line);
           } else submit(action.line);
           break;
+        }
         case "back":
           dmBack();
           break;
         case "edit-draft":
-          setDraft(action.draft);
+          putDraft(action.draft, action.cursor);
           setPaletteSel(0); // typing re-filters the `/` menu → back to the top row
           break;
+        case "move-cursor":
+          setCursor(action.cursor);
+          break;
+        case "history": {
+          if (sentHistory.length === 0) break;
+          if (action.to === "prev") {
+            // Entering history for the first time stashes whatever was half-typed.
+            if (histIdx === null) histStash.current = draft;
+            const next = histIdx === null ? sentHistory.length - 1 : Math.max(0, histIdx - 1);
+            setHistIdx(next);
+            putDraft(sentHistory[next] ?? "");
+          } else {
+            if (histIdx === null) break; // ↓ with nothing recalled does nothing
+            const next = histIdx + 1;
+            if (next >= sentHistory.length) {
+              setHistIdx(null); // walked off the newest end — restore the stashed line
+              putDraft(histStash.current);
+            } else {
+              setHistIdx(next);
+              putDraft(sentHistory[next] ?? "");
+            }
+          }
+          break;
+        }
         case "activate":
           activate(activeTab, sel);
           break;
@@ -1658,6 +1711,8 @@ export function App({
       !rosterFocused &&
       (activeTab === "lounge" || activeTab === "dms" || summonExpert != null),
   );
+  // The draft split around the caret, for the input line below.
+  const composer = caretSegments(draft, caret, cursorOn);
 
   // Presence + meter readouts for the two olive status bars (design 2a).
   const onlineExperts = useMemo(() => experts.filter((e) => e.online), [experts]);
@@ -1997,14 +2052,18 @@ export function App({
           still sends — a mention is mid-sentence, not the whole message). */}
       <MentionMenu matches={mentionMatches} sel={mentionIdx} />
 
-      {/* input line: lime context prompt + draft + blinking block cursor, or nav hint */}
+      {/* input line: lime context prompt + draft with the blinking block cursor AT the
+          caret, or nav hint. Mid-line the block covers the character it sits on and the
+          blink reveals it again, which is how a terminal caret has always looked; at the
+          end of the line there is no character, so it blinks against a space. */}
       {summonExpert ? (
         <Text color={C.muted2}> Enter authorize the hold · Esc cancel</Text>
       ) : showInput ? (
         <Box>
           <Text color={C.accent}>{loungeConnecting ? "connecting… " : `[${inputContext}] `}</Text>
-          <Text color={C.fg}>{draft}</Text>
-          <Text color={C.fg}>{cursorOn ? "█" : " "}</Text>
+          <Text color={C.fg}>{composer.before}</Text>
+          <Text color={C.fg}>{composer.at}</Text>
+          <Text color={C.fg}>{composer.after}</Text>
         </Box>
       ) : (
         <Text color={C.muted2}>{navHint}</Text>

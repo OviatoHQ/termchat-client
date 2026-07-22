@@ -52,6 +52,8 @@ export interface KeyLike {
   shift?: boolean;
   upArrow?: boolean;
   downArrow?: boolean;
+  leftArrow?: boolean;
+  rightArrow?: boolean;
   pageUp?: boolean;
   pageDown?: boolean;
   return?: boolean;
@@ -82,6 +84,9 @@ export interface NavState {
   itemCount: number;
   /** Current chat draft (only meaningful in the Lounge). */
   draft: string;
+  /** Caret position within `draft`, 0…draft.length. Omit for "end of line" — every
+   *  existing caller predates the caret and appends, so unset must mean append. */
+  cursor?: number;
   /** True while a login code is pending — freezes tab switching so the input can
    *  capture the pasted code without a stray Tab stealing focus. */
   locked: boolean;
@@ -110,7 +115,13 @@ export type NavAction =
   | { type: "move-selection"; selection: number }
   | { type: "activate" }
   | { type: "submit"; line: string }
-  | { type: "edit-draft"; draft: string }
+  /** Draft text changed. `cursor` is where the caret lands afterwards — always sent,
+   *  so the App never has to re-derive it from the old and new strings. */
+  | { type: "edit-draft"; draft: string; cursor: number }
+  /** Caret moved without changing the text (←/→, Ctrl+A/Ctrl+E). */
+  | { type: "move-cursor"; cursor: number }
+  /** Walk the sent-message history (↑/↓ in a composer). The App owns the ring. */
+  | { type: "history"; to: "prev" | "next" }
   | { type: "back" }
   // command-palette actions (the App owns the filtered list + selection index)
   | { type: "palette-move"; delta: number }
@@ -132,6 +143,68 @@ export type NavAction =
   | { type: "scroll"; to: ScrollTo }
   | { type: "none" };
 
+/** Caret index, defaulted to end-of-line and clamped into the draft. */
+function caret(state: NavState): number {
+  const end = state.draft.length;
+  if (state.cursor === undefined) return end;
+  return Math.max(0, Math.min(end, state.cursor));
+}
+
+/** Insert typed text at the caret (append when the caret is at the end). */
+function insertAt(state: NavState, text: string): NavAction {
+  const at = caret(state);
+  return {
+    type: "edit-draft",
+    draft: state.draft.slice(0, at) + text + state.draft.slice(at),
+    cursor: at + text.length,
+  };
+}
+
+/** Backspace: remove the character BEFORE the caret. A no-op at the start of the
+ *  line — returning an edit there would just re-render the same string. */
+function backspaceAt(state: NavState): NavAction {
+  const at = caret(state);
+  if (at === 0) return { type: "none" };
+  return {
+    type: "edit-draft",
+    draft: state.draft.slice(0, at - 1) + state.draft.slice(at),
+    cursor: at - 1,
+  };
+}
+
+/** ←/→ and the readline chords Ctrl+A / Ctrl+E. Returns null when the key isn't a
+ *  caret move, so a composer branch can fall through to its other handling. */
+function cursorMove(state: NavState, input: string, key: KeyLike): NavAction | null {
+  const at = caret(state);
+  if (key.leftArrow) return { type: "move-cursor", cursor: Math.max(0, at - 1) };
+  if (key.rightArrow) return { type: "move-cursor", cursor: Math.min(state.draft.length, at + 1) };
+  if (key.ctrl && input === "a") return { type: "move-cursor", cursor: 0 };
+  if (key.ctrl && input === "e") return { type: "move-cursor", cursor: state.draft.length };
+  return null;
+}
+
+/**
+ * Split a draft for rendering a block cursor sitting ON the caret.
+ *
+ * A terminal caret covers the character it is on; the blink reveals that character
+ * again. So the middle segment is the cursor glyph while `on`, and the covered
+ * character while off — which keeps the line's width identical either way, so the
+ * text after the caret never jitters as it blinks. At end-of-line there is no
+ * character to cover, so it blinks against a space.
+ */
+export function caretSegments(
+  draft: string,
+  cursor: number,
+  on: boolean,
+): { before: string; at: string; after: string } {
+  const at = Math.max(0, Math.min(draft.length, cursor));
+  return {
+    before: draft.slice(0, at),
+    at: on ? "█" : (draft[at] ?? " "),
+    after: draft.slice(at + 1),
+  };
+}
+
 function cycle(current: TabId, dir: 1 | -1): TabId {
   const i = TABS.indexOf(current);
   const next = (i + dir + TABS.length) % TABS.length;
@@ -144,8 +217,9 @@ function cycle(current: TabId, dir: 1 | -1): TabId {
  *
  * Model:
  *  - Tab / Shift+Tab switch tabs (disabled while `locked`).
- *  - In the **Lounge**, keys drive the chat input: printable → edit-draft,
- *    Backspace → edit-draft, Enter → submit, arrows scroll the transcript. `Ctrl+U`
+ *  - In the **Lounge**, keys drive the chat input: printable → edit-draft at the caret,
+ *    Backspace → edit-draft, Enter → submit, ←/→ move the caret, ↑/↓ recall sent
+ *    messages, PageUp/PageDown scroll the transcript. `Ctrl+U`
  *    hands the keyboard to the roster sidebar instead (see {@link LoungeFocus}); from
  *    there Enter opens the selected member's action menu and Esc walks back out.
  *  - In every **other** tab there is no text input: ↑/↓ move the selection,
@@ -161,8 +235,8 @@ export function reduceKey(state: NavState, input: string, key: KeyLike): NavActi
     if (key.downArrow) return { type: "palette-move", delta: 1 };
     if (key.tab || key.return) return { type: "palette-accept" };
     if (key.escape) return { type: "palette-close" };
-    if (key.backspace || key.delete) return { type: "edit-draft", draft: state.draft.slice(0, -1) };
-    if (input && !key.ctrl && !key.meta) return { type: "edit-draft", draft: state.draft + input };
+    if (key.backspace || key.delete) return backspaceAt(state);
+    if (input && !key.ctrl && !key.meta) return insertAt(state, input);
     return { type: "none" };
   }
 
@@ -217,16 +291,24 @@ export function reduceKey(state: NavState, input: string, key: KeyLike): NavActi
   if (state.activeTab === "lounge") {
     if (key.ctrl && input === "u") return { type: "roster-focus", focus: "roster" };
     if (key.return) return { type: "submit", line: state.draft };
-    // The composer is always focused (type freely, like Claude Code); scrollback rides
-    // the keys that carry no printable input, so nothing competes with typing. Esc snaps
-    // back to the newest line.
+    // The composer is always focused (type freely, like Claude Code). ←/→ walk the caret
+    // and ↑/↓ walk what you've already sent — the shell bindings everyone already has in
+    // their fingers. Scrollback therefore lives on PageUp/PageDown (and the mouse wheel);
+    // Esc still snaps to the newest line.
+    const move = cursorMove(state, input, key);
+    if (move) return move;
+    // While a login code is pending the draft IS that code — recalling history would
+    // silently replace it, and the next Enter would submit the wrong value. Caret moves
+    // are safe (they can't lose text), so only history is withheld.
+    if (key.upArrow)
+      return state.locked ? { type: "scroll", to: "up" } : { type: "history", to: "prev" };
+    if (key.downArrow)
+      return state.locked ? { type: "scroll", to: "down" } : { type: "history", to: "next" };
     if (key.pageUp) return { type: "scroll", to: "page-up" };
     if (key.pageDown) return { type: "scroll", to: "page-down" };
-    if (key.upArrow) return { type: "scroll", to: "up" };
-    if (key.downArrow) return { type: "scroll", to: "down" };
     if (key.escape) return { type: "scroll", to: "bottom" };
-    if (key.backspace || key.delete) return { type: "edit-draft", draft: state.draft.slice(0, -1) };
-    if (input && !key.ctrl && !key.meta) return { type: "edit-draft", draft: state.draft + input };
+    if (key.backspace || key.delete) return backspaceAt(state);
+    if (input && !key.ctrl && !key.meta) return insertAt(state, input);
     return { type: "none" };
   }
 
@@ -256,17 +338,19 @@ export function reduceKey(state: NavState, input: string, key: KeyLike): NavActi
       if (view === "new") return { type: "submit", line: state.draft };
       return state.draft.trim() ? { type: "submit", line: state.draft } : { type: "none" };
     }
-    // Scroll the open thread's history (Esc is taken for "back", so no bottom-snap key
-    // here — PageDown/↓ walk back to the newest line instead). The "new" composer has no
-    // transcript, so its scroll keys are harmless no-ops the App ignores.
+    // Editing works the same in every composer: ←/→ move the caret, ↑/↓ recall what you
+    // sent. Scrolling the open thread is PageUp/PageDown (Esc is taken for "back" here,
+    // so there is no bottom-snap key — PageDown walks back to the newest line).
+    const move = cursorMove(state, input, key);
+    if (move) return move;
+    if (key.upArrow) return { type: "history", to: "prev" };
+    if (key.downArrow) return { type: "history", to: "next" };
     if (view === "thread") {
       if (key.pageUp) return { type: "scroll", to: "page-up" };
       if (key.pageDown) return { type: "scroll", to: "page-down" };
-      if (key.upArrow) return { type: "scroll", to: "up" };
-      if (key.downArrow) return { type: "scroll", to: "down" };
     }
-    if (key.backspace || key.delete) return { type: "edit-draft", draft: state.draft.slice(0, -1) };
-    if (input && !key.ctrl && !key.meta) return { type: "edit-draft", draft: state.draft + input };
+    if (key.backspace || key.delete) return backspaceAt(state);
+    if (input && !key.ctrl && !key.meta) return insertAt(state, input);
     return { type: "none" };
   }
 
